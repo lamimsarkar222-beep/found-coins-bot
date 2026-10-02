@@ -1,1 +1,292 @@
 
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Found Coins - Admin Panel</title>
+
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            font-family: Arial, sans-serif;
+        }
+
+        body {
+            background: #0f1117;
+            color: white;
+            min-height: 100vh;
+        }
+
+        .header {
+            background: #171a22;
+            padding: 18px;
+            text-align: center;
+            border-bottom: 1px solid #292d38;
+        }
+
+        .header h1 {
+            font-size: 24px;
+        }
+
+        .header p {
+            color: #9da3b0;
+            margin-top: 5px;
+            font-size: 13px;
+        }
+
+        .container {
+            max-width: 1000px;
+            margin: auto;
+            padding: 20px;
+        }
+
+        .login-box {
+            max-width: 400px;
+            margin: 70px auto;
+            background: #171a22;
+            padding: 25px;
+            border-radius: 15px;
+            border: 1px solid #292d38;
+        }
+
+        .login-box h2 {
+            text-align: center;
+            margin-bottom: 20px;
+        }
+
+        input {
+            width: 100%;
+            padding: 13px;
+            margin-bottom: 12px;
+            border: 1px solid #303542;
+            border-radius: 8px;
+            background: #0f1117;
+            color: white;
+            outline: none;
+        }
+
+        button {
+            width: 100%;
+            padding: 13px;
+            border: none;
+            border-radius: 8px;
+            background: #f5b400;
+            color: #111;
+            font-weight: bold;
+            cursor: pointer;
+        }
+
+        .error {
+            color: #ff6b6b;
+            text-align: center;
+            margin-top: 12px;
+            display: none;
+        }
+
+        .panel {
+            display: none;
+        }
+
+        .cards {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 15px;
+            margin-top: 20px;
+        }
+
+        .card {
+            background: #171a22;
+            border: 1px solid #292d38;
+            padding: 20px;
+            border-radius: 14px;
+        }
+
+        .card .icon {
+            font-size: 28px;
+        }
+
+        .card h3 {
+            margin-top: 10px;
+            font-size: 14px;
+            color: #9da3b0;
+        }
+
+        .card p {
+            margin-top: 5px;
+            font-size: 24px;
+            font-weight: bold;
+        }
+
+        .menu {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 12px;
+            margin-top: 25px;
+        }
+
+        .menu button {
+            background: #20242e;
+            color: white;
+            border: 1px solid #303542;
+        }
+
+        .menu button:hover {
+            background: #292e39;
+        }
+
+        .logout {
+            margin-top: 25px;
+            background: #d9534f !important;
+            color: white !important;
+        }
+    </style>
+</head>
+
+<body>
+
+    <div class="header">
+        <h1>🪙 FOUND COINS</h1>
+        <p>Administrator Control Panel</p>
+    </div>
+
+    <!-- LOGIN -->
+    <div class="login-box" id="loginBox">
+
+        <h2>🔐 Admin Login</h2>
+
+        <input
+            type="password"
+            id="adminPassword"
+            placeholder="Enter Admin Password"
+        >
+
+        <button onclick="login()">LOGIN</button>
+
+        <div class="error" id="error">
+            Invalid password
+        </div>
+
+    </div>
+
+    <!-- ADMIN PANEL -->
+    <div class="container panel" id="panel">
+
+        <h2>Dashboard</h2>
+
+        <div class="cards">
+
+            <div class="card">
+                <div class="icon">👥</div>
+                <h3>Total Users</h3>
+                <p id="users">0</p>
+            </div>
+
+            <div class="card">
+                <div class="icon">🪙</div>
+                <h3>Total Coins</h3>
+                <p id="coins">0</p>
+            </div>
+
+            <div class="card">
+                <div class="icon">📺</div>
+                <h3>Ads Watched</h3>
+                <p id="ads">0</p>
+            </div>
+
+            <div class="card">
+                <div class="icon">💰</div>
+                <h3>Withdraw Requests</h3>
+                <p id="withdraw">0</p>
+            </div>
+
+        </div>
+
+        <div class="menu">
+
+            <button onclick="showMessage('Users Management')">
+                👥 Users
+            </button>
+
+            <button onclick="showMessage('Coins Management')">
+                🪙 Coins
+            </button>
+
+            <button onclick="showMessage('Ads Management')">
+                📺 Ads
+            </button>
+
+            <button onclick="showMessage('Daily Bonus Settings')">
+                🎁 Daily Bonus
+            </button>
+
+            <button onclick="showMessage('Referral Management')">
+                🔗 Referral
+            </button>
+
+            <button onclick="showMessage('Withdraw Management')">
+                💰 Withdraw
+            </button>
+
+            <button onclick="showMessage('Leaderboard')">
+                🏆 Leaderboard
+            </button>
+
+            <button onclick="showMessage('History')">
+                📜 History
+            </button>
+
+        </div>
+
+        <button class="logout" onclick="logout()">
+            🚪 Logout
+        </button>
+
+    </div>
+
+    <script>
+
+        function login() {
+
+            const password =
+                document.getElementById("adminPassword").value;
+
+            /*
+             * IMPORTANT:
+             * This is only the Admin Panel interface.
+             * Real password verification will be connected
+             * securely through bot.py/server.
+             */
+
+            if (password === "CHANGE_THIS_PASSWORD") {
+
+                document.getElementById("loginBox").style.display = "none";
+                document.getElementById("panel").style.display = "block";
+
+            } else {
+
+                document.getElementById("error").style.display = "block";
+
+            }
+        }
+
+        function logout() {
+
+            document.getElementById("panel").style.display = "none";
+            document.getElementById("loginBox").style.display = "block";
+            document.getElementById("adminPassword").value = "";
+
+        }
+
+        function showMessage(section) {
+
+            alert(section + " will be connected to the bot system.");
+
+        }
+
+    </script>
+
+</body>
+</html>
