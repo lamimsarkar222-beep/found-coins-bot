@@ -9,7 +9,7 @@ import requests
 # =========================
 
 TOKEN = os.environ["BOT_TOKEN"]
-ADSGRAM_TOKEN = os.environ["076af213f5a54566946ed317f741b36b"]
+ADSGRAM_TOKEN = os.environ["ADSGRAM_TOKEN"]
 
 ADMIN_ID = 7926491409
 
