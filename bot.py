@@ -18,7 +18,7 @@ ADMIN_PASSWORD = os.environ["ADMIN_PASSWORD"]
 ADMIN_ID = 7926491409
 
 # AdsGram Block ID from your dashboard
-ADSGRAM_BLOCK_ID = "49006"
+ADSGRAM_BLOCK_ID = "49050"
 ADSGRAM_TOKEN = os.environ.get("ADSGRAM_TOKEN", "")
 
 API = f"https://api.telegram.org/bot{TOKEN}"
