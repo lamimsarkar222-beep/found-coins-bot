@@ -1,2561 +1,3891 @@
-import os,html,hashlib
-from datetime import datetime,date,timedelta
-import psycopg2,psycopg2.extras,requests
-from flask import Flask,request,session,redirect
+import os
+import html
+import requests
+import psycopg2
+import psycopg2.extras
 
-TOKEN=os.environ['BOT_TOKEN']
-DBURL=os.environ['DATABASE_URL']
-ADMIN_ID=7926491409
-ADMIN_PASSWORD=os.environ.get('ADMIN_PASSWORD','')
-ADS_TOKEN=os.environ.get('ADSGRAM_TOKEN','')
-BLOCK_ID='49050'
+from datetime import datetime, date, timedelta
+from flask import Flask, request, session, redirect, url_for
 
-MIN_W=MAX_W=10000
-API=f'https://api.telegram.org/bot{TOKEN}'
+# =========================================================
+# BASIC CONFIG
+# =========================================================
 
-app=Flask(__name__)
-app.secret_key=os.environ.get(
-    'FLASK_SECRET_KEY',
-    os.environ.get('SECRET_KEY','found-coins-session')
+TOKEN = os.environ["BOT_TOKEN"]
+DATABASE_URL = os.environ["DATABASE_URL"]
+ADMIN_PASSWORD = os.environ["ADMIN_PASSWORD"]
+
+ADMIN_ID = 7926491409
+
+ADSGRAM_BLOCK_ID = "49006"
+ADSGRAM_TOKEN = os.environ.get("ADSGRAM_TOKEN", "")
+
+API = f"https://api.telegram.org/bot{TOKEN}"
+
+app = Flask(__name__)
+app.secret_key = os.environ.get(
+    "FLASK_SECRET_KEY",
+    ADMIN_PASSWORD
 )
 
+# =========================================================
+# BOT SETTINGS
+# =========================================================
+
+DAILY_BONUS = 20
+REFERRAL_BONUS = 100
+AD_REWARD = 50
+
+# 5 Daily Tasks × 5 Coins = 25 Coins/day
+DAILY_TASK_REWARD = 5
+
+MIN_WITHDRAW = 10000
+MAX_WITHDRAW = 10000
+
+# Coin Shop Badge Prices
+BADGE_1_PRICE = 2500
+BADGE_2_PRICE = 3500
+BADGE_3_PRICE = 4500
+VIP_BADGE_PRICE = 5000
+
+# Active means user interacted with bot
+# within this many minutes.
+ACTIVE_MINUTES = 10
+
+# =========================================================
+# DATABASE
+# =========================================================
+
 def db():
-    return psycopg2.connect(DBURL)
+    return psycopg2.connect(
+        DATABASE_URL,
+        connect_timeout=10
+    )
+
+
+def init_db():
+
+    conn = db()
+    cur = conn.cursor()
+
+    # Existing users table
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id BIGINT PRIMARY KEY,
+            username TEXT,
+            coins INTEGER DEFAULT 0,
+            ads_watched INTEGER DEFAULT 0,
+            coins_earned INTEGER DEFAULT 0,
+            last_bonus TEXT,
+            referred_by BIGINT,
+            joined_at TEXT,
+            blocked INTEGER DEFAULT 0
+        )
+    """)
+
+    # Existing history
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS history (
+            id BIGSERIAL PRIMARY KEY,
+            user_id BIGINT,
+            amount INTEGER,
+            reason TEXT,
+            created_at TEXT
+        )
+    """)
+
+    # Existing withdrawals
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS withdrawals (
+            id BIGSERIAL PRIMARY KEY,
+            user_id BIGINT,
+            username TEXT,
+            method TEXT,
+            number TEXT,
+            coins INTEGER,
+            status TEXT DEFAULT 'pending',
+            created_at TEXT
+        )
+    """)
+
+    # Existing pending ads
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS pending_ads (
+            user_id BIGINT PRIMARY KEY,
+            created_at TEXT
+        )
+    """)
+
+    # Daily task claims
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS daily_task_claims (
+            user_id BIGINT NOT NULL,
+            task_date DATE NOT NULL,
+            task_key TEXT NOT NULL,
+            claimed_at TEXT NOT NULL,
+            PRIMARY KEY (user_id, task_date, task_key)
+        )
+    """)
+
+    # Quiz attempts
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS quiz_attempts (
+            user_id BIGINT NOT NULL,
+            quiz_date DATE NOT NULL,
+            question_id INTEGER NOT NULL,
+            correct INTEGER DEFAULT 0,
+            answered_at TEXT NOT NULL,
+            PRIMARY KEY (user_id, quiz_date)
+        )
+    """)
+
+    # -----------------------------------------------------
+    # NEW PROFILE / BADGE / ACTIVITY FIELDS
+    # -----------------------------------------------------
+
+    cur.execute("""
+        ALTER TABLE users
+        ADD COLUMN IF NOT EXISTS profile_name TEXT
+    """)
+
+    cur.execute("""
+        ALTER TABLE users
+        ADD COLUMN IF NOT EXISTS profile_photo_file_id TEXT
+    """)
+
+    cur.execute("""
+        ALTER TABLE users
+        ADD COLUMN IF NOT EXISTS badge TEXT
+    """)
+
+    cur.execute("""
+        ALTER TABLE users
+        ADD COLUMN IF NOT EXISTS last_seen TEXT
+    """)
+
+    # Profile input state
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS profile_states (
+            user_id BIGINT PRIMARY KEY,
+            action TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    conn.commit()
+
+    cur.close()
+    conn.close()
+
+
+init_db()
+
+# =========================================================
+# HELPERS
+# =========================================================
 
 def now():
-    return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
 
 def today():
-    return date.today().isoformat()
+    return date.today()
 
-def q(sql,args=(),dictcur=False,fetch=False):
-    c=db()
-    cur=c.cursor(
+
+def get_user(user_id):
+
+    conn = db()
+
+    cur = conn.cursor(
         cursor_factory=psycopg2.extras.RealDictCursor
-        if dictcur else None
     )
-    cur.execute(sql,args)
-    r=cur.fetchall() if fetch else cur.rowcount
-    c.commit()
+
+    cur.execute(
+        "SELECT * FROM users WHERE user_id=%s",
+        (user_id,)
+    )
+
+    user = cur.fetchone()
+
     cur.close()
-    c.close()
-    return r
+    conn.close()
 
-def init():
-    c=db()
-    cur=c.cursor()
+    return user
 
-    tables=[
-        """CREATE TABLE IF NOT EXISTS users(
-        user_id BIGINT PRIMARY KEY,
-        username TEXT,
-        coins INTEGER DEFAULT 0,
-        ads_watched INTEGER DEFAULT 0,
-        coins_earned INTEGER DEFAULT 0,
-        last_bonus TEXT,
-        referred_by BIGINT,
-        joined_at TEXT,
-        blocked INTEGER DEFAULT 0)""",
 
-        """CREATE TABLE IF NOT EXISTS history(
-        id BIGSERIAL PRIMARY KEY,
-        user_id BIGINT,
-        amount INTEGER,
-        reason TEXT,
-        created_at TEXT)""",
+def create_user(user_id, username=None, referred_by=None):
 
-        """CREATE TABLE IF NOT EXISTS withdrawals(
-        id BIGSERIAL PRIMARY KEY,
-        user_id BIGINT,
-        username TEXT,
-        method TEXT,
-        number TEXT,
-        coins INTEGER,
-        status TEXT DEFAULT 'pending',
-        created_at TEXT)""",
+    conn = db()
+    cur = conn.cursor()
 
-        """CREATE TABLE IF NOT EXISTS pending_ads(
-        user_id BIGINT PRIMARY KEY,
-        created_at TEXT)""",
+    cur.execute("""
+        INSERT INTO users
+        (
+            user_id,
+            username,
+            coins,
+            ads_watched,
+            coins_earned,
+            last_bonus,
+            referred_by,
+            joined_at,
+            blocked,
+            last_seen
+        )
+        VALUES (%s, %s, 0, 0, 0, NULL, %s, %s, 0, %s)
 
-        """CREATE TABLE IF NOT EXISTS bot_settings(
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL)""",
+        ON CONFLICT (user_id)
+        DO UPDATE SET
+            username = EXCLUDED.username,
+            last_seen = EXCLUDED.last_seen
+    """, (
+        user_id,
+        username,
+        referred_by,
+        now(),
+        now()
+    ))
 
-        """CREATE TABLE IF NOT EXISTS daily_task_claims(
-        id BIGSERIAL PRIMARY KEY,
-        user_id BIGINT NOT NULL,
-        task_key TEXT NOT NULL,
-        claim_date TEXT NOT NULL,
-        reward INTEGER NOT NULL,
-        created_at TEXT NOT NULL,
-        UNIQUE(user_id,task_key,claim_date))""",
+    conn.commit()
 
-        """CREATE TABLE IF NOT EXISTS quiz_attempts(
-        id BIGSERIAL PRIMARY KEY,
-        user_id BIGINT NOT NULL,
-        question_key TEXT NOT NULL,
-        attempt_date TEXT NOT NULL,
-        correct INTEGER DEFAULT 0,
-        created_at TEXT NOT NULL,
-        UNIQUE(user_id,attempt_date))""",
+    cur.close()
+    conn.close()
 
-        """CREATE TABLE IF NOT EXISTS user_stats(
-        user_id BIGINT PRIMARY KEY,
-        task_completed INTEGER DEFAULT 0,
-        daily_streak INTEGER DEFAULT 0,
-        last_checkin TEXT)""",
 
-        """CREATE TABLE IF NOT EXISTS shop_items(
-        id BIGSERIAL PRIMARY KEY,
-        name TEXT NOT NULL,
-        description TEXT DEFAULT '',
-        price INTEGER NOT NULL,
-        active INTEGER DEFAULT 1,
-        created_at TEXT NOT NULL)""",
+def update_last_seen(user_id):
 
-        """CREATE TABLE IF NOT EXISTS shop_purchases(
-        id BIGSERIAL PRIMARY KEY,
-        user_id BIGINT NOT NULL,
-        item_id BIGINT NOT NULL,
-        item_name TEXT NOT NULL,
-        price INTEGER NOT NULL,
-        status TEXT DEFAULT 'pending',
-        created_at TEXT NOT NULL,
-        processed_at TEXT)"""
-    ]
+    conn = db()
+    cur = conn.cursor()
 
-    for s in tables:
-        cur.execute(s)
+    cur.execute("""
+        UPDATE users
+        SET last_seen=%s,
+            blocked=0
+        WHERE user_id=%s
+    """, (
+        now(),
+        user_id
+    ))
 
-    for k,v in {
-        'daily_bonus':5,
-        'ad_reward':50,
-        'referral_bonus':100,
-        'task_reward':5
-    }.items():
-        cur.execute(
-            "INSERT INTO bot_settings(key,value) "
-            "VALUES(%s,%s) "
-            "ON CONFLICT(key) DO NOTHING",
-            (k,str(v))
+    conn.commit()
+
+    cur.close()
+    conn.close()
+
+
+def add_history(user_id, amount, reason):
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO history
+        (user_id, amount, reason, created_at)
+        VALUES (%s, %s, %s, %s)
+    """, (
+        user_id,
+        amount,
+        reason,
+        now()
+    ))
+
+    conn.commit()
+
+    cur.close()
+    conn.close()
+
+
+def add_coins(user_id, amount, reason):
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        UPDATE users
+        SET
+            coins = coins + %s,
+            coins_earned =
+                CASE
+                    WHEN %s > 0
+                    THEN coins_earned + %s
+                    ELSE coins_earned
+                END
+        WHERE user_id=%s
+    """, (
+        amount,
+        amount,
+        amount,
+        user_id
+    ))
+
+    changed = cur.rowcount
+
+    conn.commit()
+
+    cur.close()
+    conn.close()
+
+    if changed:
+        add_history(
+            user_id,
+            amount,
+            reason
         )
 
-    cur.execute('SELECT COUNT(*) FROM shop_items')
+    return changed > 0
 
-    if cur.fetchone()[0]==0:
-        for x in [
-            ('🥉 Bronze Badge','Virtual badge',500),
-            ('🥈 Silver Badge','Virtual badge',1000),
-            ('🥇 Gold Badge','Virtual badge',2000),
-            ('👑 VIP Badge','Special badge',5000)
-        ]:
-            cur.execute(
-                'INSERT INTO shop_items'
-                '(name,description,price,active,created_at) '
-                'VALUES(%s,%s,%s,1,%s)',
-                (*x,now())
-            )
 
-    c.commit()
+def coins_to_taka(coins):
+
+    return coins / 100
+
+
+# =========================================================
+# PROFILE STATE
+# =========================================================
+
+def set_profile_state(user_id, action):
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO profile_states
+        (user_id, action, created_at)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (user_id)
+        DO UPDATE SET
+            action=EXCLUDED.action,
+            created_at=EXCLUDED.created_at
+    """, (
+        user_id,
+        action,
+        now()
+    ))
+
+    conn.commit()
+
     cur.close()
-    c.close()
+    conn.close()
 
-init()
 
-def user(uid):
-    r=q(
-        'SELECT * FROM users WHERE user_id=%s',
-        (uid,),
-        True,
-        True
-    )
-    return r[0] if r else None
+def get_profile_state(user_id):
 
-def ensure(uid,uname=None):
-    q(
-        'INSERT INTO users(user_id,username,joined_at) '
-        'VALUES(%s,%s,%s) '
-        'ON CONFLICT(user_id) '
-        'DO UPDATE SET username=EXCLUDED.username',
-        (uid,uname,now())
-    )
+    conn = db()
+    cur = conn.cursor()
 
-    q(
-        'INSERT INTO user_stats(user_id) VALUES(%s) '
-        'ON CONFLICT(user_id) DO NOTHING',
-        (uid,)
-    )
+    cur.execute("""
+        SELECT action
+        FROM profile_states
+        WHERE user_id=%s
+    """, (
+        user_id,
+    ))
 
-def hist(uid,amt,reason):
-    q(
-        'INSERT INTO history'
-        '(user_id,amount,reason,created_at) '
-        'VALUES(%s,%s,%s,%s)',
-        (uid,amt,reason,now())
-    )
+    row = cur.fetchone()
 
-def add(uid,amt,reason):
-    r=q(
-        'UPDATE users '
-        'SET coins=coins+%s,'
-        'coins_earned=CASE '
-        'WHEN %s>0 THEN coins_earned+%s '
-        'ELSE coins_earned END '
-        'WHERE user_id=%s',
-        (amt,amt,amt,uid)
-    )
+    cur.close()
+    conn.close()
 
-    if isinstance(r,int) and r>0:
-        hist(uid,amt,reason)
+    if row:
+        return row[0]
 
-def setting(k,d):
-    r=q(
-        'SELECT value FROM bot_settings WHERE key=%s',
-        (k,),
-        False,
-        True
-    )
+    return None
+
+
+def clear_profile_state(user_id):
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        DELETE FROM profile_states
+        WHERE user_id=%s
+    """, (
+        user_id,
+    ))
+
+    conn.commit()
+
+    cur.close()
+    conn.close()
+
+
+# =========================================================
+# TELEGRAM
+# =========================================================
+
+def telegram(method, data=None):
 
     try:
-        return int(r[0][0]) if r else d
-    except:
-        return d
 
-def setsetting(k,v):
-    q(
-        'INSERT INTO bot_settings(key,value) '
-        'VALUES(%s,%s) '
-        'ON CONFLICT(key) '
-        'DO UPDATE SET value=EXCLUDED.value',
-        (k,str(max(0,int(v))))
-    )
-
-def tg(method,data):
-    try:
-        return requests.post(
-            f'{API}/{method}',
-            json=data,
+        response = requests.post(
+            f"{API}/{method}",
+            json=data or {},
             timeout=20
-        ).json()
+        )
+
+        return response.json()
+
     except Exception as e:
-        print('TG:',e)
+
+        print("Telegram API error:", e)
+
         return None
 
-def send(uid,text,markup=None,protect=False,parse=None):
-    d={
-        'chat_id':uid,
-        'text':text
+
+def send_message(
+    chat_id,
+    text,
+    reply_markup=None,
+    protect=False,
+    parse_mode=None
+):
+
+    data = {
+        "chat_id": chat_id,
+        "text": text
     }
 
-    if markup:
-        d['reply_markup']=markup
+    if reply_markup is not None:
+        data["reply_markup"] = reply_markup
 
     if protect:
-        d['protect_content']=True
+        data["protect_content"] = True
 
-    if parse:
-        d['parse_mode']=parse
+    if parse_mode:
+        data["parse_mode"] = parse_mode
 
-    return tg('sendMessage',d)
-
-def answer(cid,text=''):
-    return tg(
-        'answerCallbackQuery',
-        {
-            'callback_query_id':cid,
-            'text':text
-        }
+    return telegram(
+        "sendMessage",
+        data
     )
 
-def menu():
-    return {
-        'keyboard':[
-            [
-                {'text':'🪙 My Coins'},
-                {'text':'📺 Watch Ad'}
-            ],
-            [
-                {'text':'📋 Daily Tasks'},
-                {'text':'👤 My Profile'}
-            ],
-            [
-                {'text':'🎁 Daily Bonus'},
-                {'text':'👥 Referral'}
-            ],
-            [
-                {'text':'🛍️ Coin Shop'},
-                {'text':'💰 Withdraw'}
-            ],
-            [
-                {'text':'🏆 Leaderboard'},
-                {'text':'📜 History'}
-            ]
-        ],
-        'resize_keyboard':True
+
+def send_photo(
+    chat_id,
+    photo,
+    caption,
+    reply_markup=None,
+    protect=False
+):
+
+    data = {
+        "chat_id": chat_id,
+        "photo": photo,
+        "caption": caption
     }
 
-# =========================
-# ADSGRAM
-# =========================
+    if reply_markup is not None:
+        data["reply_markup"] = reply_markup
 
-def ad(uid):
-    if not ADS_TOKEN:
+    if protect:
+        data["protect_content"] = True
+
+    return telegram(
+        "sendPhoto",
+        data
+    )
+
+
+def answer_callback(callback_id, text=None):
+
+    data = {
+        "callback_query_id": callback_id
+    }
+
+    if text:
+        data["text"] = text
+
+    return telegram(
+        "answerCallbackQuery",
+        data
+    )
+
+
+def edit_message(
+    chat_id,
+    message_id,
+    text,
+    reply_markup=None
+):
+
+    data = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text
+    }
+
+    if reply_markup is not None:
+        data["reply_markup"] = reply_markup
+
+    return telegram(
+        "editMessageText",
+        data
+    )
+
+
+# =========================================================
+# MAIN MENU
+# =========================================================
+
+def main_menu():
+
+    return {
+        "keyboard": [
+            [
+                {
+                    "text": "🪙 My Coins"
+                },
+                {
+                    "text": "📺 Watch Ad"
+                }
+            ],
+            [
+                {
+                    "text": "📋 Daily Tasks"
+                },
+                {
+                    "text": "🎁 Daily Bonus"
+                }
+            ],
+            [
+                {
+                    "text": "👤 My Profile"
+                },
+                {
+                    "text": "👥 Referral"
+                }
+            ],
+            [
+                {
+                    "text": "💰 Withdraw"
+                },
+                {
+                    "text": "🏆 Leaderboard"
+                }
+            ],
+            [
+                {
+                    "text": "📜 History"
+                }
+            ]
+        ],
+        "resize_keyboard": True
+    }
+
+
+# =========================================================
+# DAILY TASKS
+# =========================================================
+
+TASK_NAMES = {
+    "daily_bonus": "🎁 Daily Bonus",
+    "daily_quiz": "🎯 Daily Quiz",
+    "coin_checkin": "🪙 Coin Check-in",
+    "daily_knowledge": "📚 Daily Knowledge",
+    "world_facts": "🌍 World Facts"
+}
+
+
+def task_claimed(user_id, task_key):
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT 1
+        FROM daily_task_claims
+        WHERE user_id=%s
+        AND task_date=%s
+        AND task_key=%s
+    """, (
+        user_id,
+        today(),
+        task_key
+    ))
+
+    result = cur.fetchone()
+
+    cur.close()
+    conn.close()
+
+    return result is not None
+
+
+def claim_task(user_id, task_key, reason):
+
+    conn = db()
+    cur = conn.cursor()
+
+    try:
+
+        cur.execute("""
+            INSERT INTO daily_task_claims
+            (
+                user_id,
+                task_date,
+                task_key,
+                claimed_at
+            )
+            VALUES (%s, %s, %s, %s)
+
+            ON CONFLICT
+            (user_id, task_date, task_key)
+            DO NOTHING
+        """, (
+            user_id,
+            today(),
+            task_key,
+            now()
+        ))
+
+        inserted = cur.rowcount == 1
+
+        if inserted:
+
+            cur.execute("""
+                UPDATE users
+                SET
+                    coins = coins + %s,
+                    coins_earned = coins_earned + %s
+                WHERE user_id=%s
+            """, (
+                DAILY_TASK_REWARD,
+                DAILY_TASK_REWARD,
+                user_id
+            ))
+
+            cur.execute("""
+                INSERT INTO history
+                (
+                    user_id,
+                    amount,
+                    reason,
+                    created_at
+                )
+                VALUES (%s, %s, %s, %s)
+            """, (
+                user_id,
+                DAILY_TASK_REWARD,
+                reason,
+                now()
+            ))
+
+        conn.commit()
+
+        return inserted
+
+    except Exception:
+
+        conn.rollback()
+        raise
+
+    finally:
+
+        cur.close()
+        conn.close()
+
+
+def task_order():
+
+    keys = [
+        "daily_bonus",
+        "daily_quiz",
+        "coin_checkin",
+        "daily_knowledge",
+        "world_facts"
+    ]
+
+    # Changes order every day
+    shift = today().toordinal() % len(keys)
+
+    return keys[shift:] + keys[:shift]
+
+
+def daily_tasks_keyboard(user_id):
+
+    rows = []
+
+    for task_key in task_order():
+
+        done = task_claimed(
+            user_id,
+            task_key
+        )
+
+        name = TASK_NAMES[task_key]
+
+        rows.append([
+            {
+                "text":
+                    (
+                        f"✅ {name} — {DAILY_TASK_REWARD}"
+                        if done
+                        else f"{name} — {DAILY_TASK_REWARD}"
+                    ),
+                "callback_data":
+                    f"task:{task_key}"
+            }
+        ])
+
+    return {
+        "inline_keyboard": rows
+    }
+
+
+def show_daily_tasks(user_id, message_id=None):
+
+    task_keys = [
+        "daily_bonus",
+        "daily_quiz",
+        "coin_checkin",
+        "daily_knowledge",
+        "world_facts"
+    ]
+
+    done = 0
+
+    for key in task_keys:
+
+        if task_claimed(user_id, key):
+            done += 1
+
+    total_reward = len(task_keys) * DAILY_TASK_REWARD
+    earned_reward = done * DAILY_TASK_REWARD
+
+    text = (
+        "📋 Daily Tasks\n\n"
+        "আজকের ৫টি Task সম্পন্ন করো।\n"
+        "প্রতিদিন Task-এর order পরিবর্তন হবে।\n\n"
+        f"✅ Completed: {done}/5\n"
+        f"🏆 Earned Today: "
+        f"{earned_reward}/{total_reward} Coins\n\n"
+        f"প্রতিটি Task = {DAILY_TASK_REWARD} Coins\n\n"
+        "আজকের Task List:"
+    )
+
+    markup = daily_tasks_keyboard(user_id)
+
+    if message_id:
+
+        edit_message(
+            user_id,
+            message_id,
+            text,
+            markup
+        )
+
+    else:
+
+        send_message(
+            user_id,
+            text,
+            markup
+        )
+
+
+# =========================================================
+# DAILY QUIZ / KNOWLEDGE / WORLD FACTS
+# =========================================================
+
+QUIZ_QUESTIONS = [
+
+    {
+        "question": "বাংলাদেশের মুদ্রার নাম কী?",
+        "options": [
+            "টাকা",
+            "রুপি",
+            "ডলার",
+            "ইউরো"
+        ],
+        "answer": 0
+    },
+
+    {
+        "question": "ভারতের মুদ্রার নাম কী?",
+        "options": [
+            "রুপি",
+            "টাকা",
+            "দিনার",
+            "ইউরো"
+        ],
+        "answer": 0
+    },
+
+    {
+        "question": "যুক্তরাষ্ট্রের মুদ্রার নাম কী?",
+        "options": [
+            "ডলার",
+            "রুপি",
+            "টাকা",
+            "পাউন্ড"
+        ],
+        "answer": 0
+    },
+
+    {
+        "question": "জাপানের মুদ্রার নাম কী?",
+        "options": [
+            "ইয়েন",
+            "রুপি",
+            "ডলার",
+            "দিনার"
+        ],
+        "answer": 0
+    },
+
+    {
+        "question": "যুক্তরাজ্যের মুদ্রার নাম কী?",
+        "options": [
+            "পাউন্ড",
+            "ডলার",
+            "ইয়েন",
+            "রুপি"
+        ],
+        "answer": 0
+    },
+
+    {
+        "question": "কোনটি সাধারণত ধাতব মুদ্রা?",
+        "options": [
+            "কয়েন",
+            "নোট",
+            "চেক",
+            "কার্ড"
+        ],
+        "answer": 0
+    }
+]
+
+
+KNOWLEDGE_QUESTIONS = [
+
+    {
+        "question": "পৃথিবীর সবচেয়ে বড় মহাসাগর কোনটি?",
+        "options": [
+            "প্রশান্ত মহাসাগর",
+            "আটলান্টিক মহাসাগর",
+            "ভারত মহাসাগর",
+            "আর্কটিক মহাসাগর"
+        ],
+        "answer": 0
+    },
+
+    {
+        "question": "মানুষের শরীরে রক্ত পাম্প করে কোন অঙ্গ?",
+        "options": [
+            "হৃদপিণ্ড",
+            "ফুসফুস",
+            "কিডনি",
+            "মস্তিষ্ক"
+        ],
+        "answer": 0
+    },
+
+    {
+        "question": "সূর্যের সবচেয়ে কাছের গ্রহ কোনটি?",
+        "options": [
+            "বুধ",
+            "শুক্র",
+            "পৃথিবী",
+            "মঙ্গল"
+        ],
+        "answer": 0
+    },
+
+    {
+        "question": "পানির রাসায়নিক সংকেত কী?",
+        "options": [
+            "H₂O",
+            "CO₂",
+            "O₂",
+            "NaCl"
+        ],
+        "answer": 0
+    },
+
+    {
+        "question": "বাংলাদেশের জাতীয় ফুল কোনটি?",
+        "options": [
+            "শাপলা",
+            "গোলাপ",
+            "জবা",
+            "সূর্যমুখী"
+        ],
+        "answer": 0
+    }
+]
+
+
+WORLD_FACTS_QUESTIONS = [
+
+    {
+        "question": "জাপানের রাজধানী কোনটি?",
+        "options": [
+            "টোকিও",
+            "ঢাকা",
+            "বেইজিং",
+            "সিউল"
+        ],
+        "answer": 0
+    },
+
+    {
+        "question": "ফ্রান্সের রাজধানী কোনটি?",
+        "options": [
+            "প্যারিস",
+            "লন্ডন",
+            "রোম",
+            "বার্লিন"
+        ],
+        "answer": 0
+    },
+
+    {
+        "question": "মিশরের বিখ্যাত পিরামিড কোথায় অবস্থিত?",
+        "options": [
+            "গিজা",
+            "টোকিও",
+            "লন্ডন",
+            "ঢাকা"
+        ],
+        "answer": 0
+    },
+
+    {
+        "question": "চীনের রাজধানী কোনটি?",
+        "options": [
+            "বেইজিং",
+            "সাংহাই",
+            "টোকিও",
+            "সিউল"
+        ],
+        "answer": 0
+    },
+
+    {
+        "question": "অস্ট্রেলিয়ার রাজধানী কোনটি?",
+        "options": [
+            "ক্যানবেরা",
+            "সিডনি",
+            "মেলবোর্ন",
+            "পারথ"
+        ],
+        "answer": 0
+    }
+]
+
+
+def todays_question(question_list):
+
+    index = today().toordinal() % len(question_list)
+
+    return index, question_list[index]
+
+
+def show_general_quiz(
+    user_id,
+    task_key,
+    title,
+    question_list,
+    message_id=None
+):
+
+    question_id, quiz = todays_question(
+        question_list
+    )
+
+    keyboard = []
+
+    for index, option in enumerate(
+        quiz["options"]
+    ):
+
+        keyboard.append([
+            {
+                "text": option,
+                "callback_data":
+                    f"mcq:{task_key}:{question_id}:{index}"
+            }
+        ])
+
+    text = (
+        f"{title}\n\n"
+        f"{quiz['question']}\n\n"
+        "সঠিক উত্তর নির্বাচন করো।\n"
+        f"সঠিক হলে +{DAILY_TASK_REWARD} Coins পাবে।"
+    )
+
+    markup = {
+        "inline_keyboard": keyboard
+    }
+
+    if message_id:
+
+        edit_message(
+            user_id,
+            message_id,
+            text,
+            markup
+        )
+
+    else:
+
+        send_message(
+            user_id,
+            text,
+            markup
+        )
+
+
+def handle_general_mcq(
+    user_id,
+    callback_id,
+    message_id,
+    task_key,
+    question_id,
+    selected,
+    question_list,
+    title
+):
+
+    real_id, quiz = todays_question(
+        question_list
+    )
+
+    if question_id != real_id:
+
+        answer_callback(
+            callback_id,
+            "এই প্রশ্নটি আর সক্রিয় নেই।"
+        )
+
+        return
+
+    if task_claimed(
+        user_id,
+        task_key
+    ):
+
+        answer_callback(
+            callback_id,
+            "আজকের Task ইতিমধ্যে সম্পন্ন।"
+        )
+
+        return
+
+    attempt_key = f"{task_key}_{today()}"
+
+    conn = db()
+    cur = conn.cursor()
+
+    try:
+
+        cur.execute("""
+            INSERT INTO quiz_attempts
+            (
+                user_id,
+                quiz_date,
+                question_id,
+                correct,
+                answered_at
+            )
+            VALUES (%s, %s, %s, %s, %s)
+
+            ON CONFLICT
+            (user_id, quiz_date)
+            DO NOTHING
+        """, (
+            user_id,
+            today(),
+            question_id,
+            1 if selected == quiz["answer"] else 0,
+            now()
+        ))
+
+        # The original quiz_attempts table has one row/day.
+        # To support 3 different quiz-type tasks safely,
+        # use a separate unique task key table below.
+        inserted = cur.rowcount == 1
+
+        conn.rollback()
+
+    except Exception:
+        conn.rollback()
+        inserted = True
+
+    finally:
+        cur.close()
+        conn.close()
+
+    # Daily claim is the actual protection against double reward.
+    if selected == quiz["answer"]:
+
+        success = claim_task(
+            user_id,
+            task_key,
+            title
+        )
+
+        if success:
+
+            answer_callback(
+                callback_id,
+                f"🎉 সঠিক! +{DAILY_TASK_REWARD} Coins"
+            )
+
+            send_message(
+                user_id,
+                f"🎉 সঠিক উত্তর!\n\n"
+                f"{title} সম্পন্ন হয়েছে।\n"
+                f"+{DAILY_TASK_REWARD} Coins যোগ হয়েছে।"
+            )
+
+        else:
+
+            answer_callback(
+                callback_id,
+                "এই Task ইতিমধ্যে সম্পন্ন হয়েছে।"
+            )
+
+    else:
+
+        answer_callback(
+            callback_id,
+            "❌ ভুল উত্তর। আজকের Task-এর Coins পাওয়া যাবে না।"
+        )
+
+        send_message(
+            user_id,
+            f"❌ উত্তরটি সঠিক হয়নি।\n\n"
+            f"{title}-এর জন্য আজ আর Coins পাওয়া যাবে না।"
+        )
+
+    show_daily_tasks(
+        user_id,
+        message_id
+    )
+
+
+def show_quiz(user_id, message_id=None):
+
+    show_general_quiz(
+        user_id,
+        "daily_quiz",
+        "🎯 Daily Quiz",
+        QUIZ_QUESTIONS,
+        message_id
+    )
+
+
+def handle_quiz_answer(
+    user_id,
+    callback_id,
+    message_id,
+    question_id,
+    selected
+):
+
+    handle_general_mcq(
+        user_id,
+        callback_id,
+        message_id,
+        "daily_quiz",
+        question_id,
+        selected,
+        QUIZ_QUESTIONS,
+        "🎯 Daily Quiz"
+    )
+
+
+# =========================================================
+# BADGE / COIN SHOP
+# =========================================================
+
+BADGES = {
+    "badge1": {
+        "name": "🏅 Badge 1",
+        "price": BADGE_1_PRICE
+    },
+    "badge2": {
+        "name": "🥇 Badge 2",
+        "price": BADGE_2_PRICE
+    },
+    "badge3": {
+        "name": "💎 Badge 3",
+        "price": BADGE_3_PRICE
+    },
+    "vip": {
+        "name": "👑 VIP Badge",
+        "price": VIP_BADGE_PRICE
+    }
+}
+
+
+def badge_shop_keyboard():
+
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": f"🏅 Badge 1 — {BADGE_1_PRICE:,}",
+                    "callback_data": "buy_badge:badge1"
+                }
+            ],
+            [
+                {
+                    "text": f"🥇 Badge 2 — {BADGE_2_PRICE:,}",
+                    "callback_data": "buy_badge:badge2"
+                }
+            ],
+            [
+                {
+                    "text": f"💎 Badge 3 — {BADGE_3_PRICE:,}",
+                    "callback_data": "buy_badge:badge3"
+                }
+            ],
+            [
+                {
+                    "text": f"👑 VIP Badge — {VIP_BADGE_PRICE:,}",
+                    "callback_data": "buy_badge:vip"
+                }
+            ],
+            [
+                {
+                    "text": "⬅️ Back to Profile",
+                    "callback_data": "profile"
+                }
+            ]
+        ]
+    }
+
+
+def show_badge_shop(user_id):
+
+    text = (
+        "🛍️ Badge Coin Shop\n\n"
+        "Coins দিয়ে Badge কিনতে পারবে।\n"
+        "একটি Badge কেনার পর সেটি তোমার Profile-এ Active থাকবে।\n\n"
+        f"🏅 Badge 1 — {BADGE_1_PRICE:,} Coins\n"
+        f"🥇 Badge 2 — {BADGE_2_PRICE:,} Coins\n"
+        f"💎 Badge 3 — {BADGE_3_PRICE:,} Coins\n"
+        f"👑 VIP Badge — {VIP_BADGE_PRICE:,} Coins\n\n"
+        "👑 VIP Badge থাকলে VIP status দেখাবে।"
+    )
+
+    send_message(
+        user_id,
+        text,
+        badge_shop_keyboard()
+    )
+
+
+def buy_badge(user_id, badge_key, callback_id):
+
+    if badge_key not in BADGES:
+
+        answer_callback(
+            callback_id,
+            "Badge পাওয়া যায়নি।"
+        )
+
+        return
+
+    badge = BADGES[badge_key]
+
+    conn = db()
+    cur = conn.cursor()
+
+    try:
+
+        cur.execute("""
+            SELECT coins, badge
+            FROM users
+            WHERE user_id=%s
+            FOR UPDATE
+        """, (
+            user_id,
+        ))
+
+        user = cur.fetchone()
+
+        if not user:
+
+            conn.rollback()
+
+            answer_callback(
+                callback_id,
+                "User পাওয়া যায়নি।"
+            )
+
+            return
+
+        if user[1]:
+
+            conn.rollback()
+
+            answer_callback(
+                callback_id,
+                "তোমার একটি Badge ইতিমধ্যে Active আছে।"
+            )
+
+            return
+
+        if user[0] < badge["price"]:
+
+            conn.rollback()
+
+            remaining = badge["price"] - user[0]
+
+            answer_callback(
+                callback_id,
+                f"আর {remaining:,} Coins প্রয়োজন।"
+            )
+
+            return
+
+        cur.execute("""
+            UPDATE users
+            SET
+                coins = coins - %s,
+                badge = %s
+            WHERE user_id=%s
+            AND coins >= %s
+            AND badge IS NULL
+        """, (
+            badge["price"],
+            badge["name"],
+            user_id,
+            badge["price"]
+        ))
+
+        if cur.rowcount != 1:
+
+            conn.rollback()
+
+            answer_callback(
+                callback_id,
+                "Badge purchase failed। আবার চেষ্টা করুন।"
+            )
+
+            return
+
+        cur.execute("""
+            INSERT INTO history
+            (
+                user_id,
+                amount,
+                reason,
+                created_at
+            )
+            VALUES (%s, %s, %s, %s)
+        """, (
+            user_id,
+            -badge["price"],
+            f"Purchased {badge['name']}",
+            now()
+        ))
+
+        conn.commit()
+
+    except Exception as e:
+
+        conn.rollback()
+
+        print(
+            "Badge purchase error:",
+            e
+        )
+
+        answer_callback(
+            callback_id,
+            "Badge purchase-এ সমস্যা হয়েছে।"
+        )
+
+        return
+
+    finally:
+
+        cur.close()
+        conn.close()
+
+    answer_callback(
+        callback_id,
+        f"{badge['name']} Active হয়েছে!"
+    )
+
+    send_message(
+        user_id,
+        f"🎉 Badge Purchase Successful!\n\n"
+        f"{badge['name']}\n"
+        f"💰 Price: {badge['price']:,} Coins\n\n"
+        "তোমার Profile-এ Badge এখন Active।"
+    )
+
+    show_profile(
+        user_id
+    )
+
+
+# =========================================================
+# MY PROFILE
+# =========================================================
+
+def profile_keyboard():
+
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": "✏️ Customize Name",
+                    "callback_data": "profile_name"
+                }
+            ],
+            [
+                {
+                    "text": "📷 Set Profile Photo",
+                    "callback_data": "profile_photo"
+                }
+            ],
+            [
+                {
+                    "text": "🛍️ Badge Coin Shop",
+                    "callback_data": "badge_shop"
+                }
+            ]
+        ]
+    }
+
+
+def profile_text(user):
+
+    profile_name = (
+        user["profile_name"]
+        or (
+            f"@{user['username']}"
+            if user["username"]
+            else f"User {user['user_id']}"
+        )
+    )
+
+    coins = user["coins"] or 0
+    amount = coins_to_taka(coins)
+
+    if amount == int(amount):
+        amount_text = f"৳{int(amount)}"
+    else:
+        amount_text = f"৳{amount:.2f}"
+
+    badge = user["badge"] or "No Badge"
+
+    vip_text = ""
+
+    if user["badge"] == "👑 VIP Badge":
+        vip_text = (
+            "\n👑 VIP Status: ACTIVE\n"
+            "⭐ Special Service: Available\n"
+        )
+
+    return (
+        "👤 My Profile\n\n"
+        f"📝 Name: {profile_name}\n"
+        f"🪙 My Coins: {coins:,} Coins\n"
+        f"💵 My Balance: {amount_text}\n"
+        f"🏅 Badge: {badge}\n"
+        f"{vip_text}\n"
+        "🛍️ নিচের Coin Shop থেকে Badge কিনতে পারবে।"
+    )
+
+
+def show_profile(user_id):
+
+    user = get_user(user_id)
+
+    if not user:
+        return
+
+    text = profile_text(user)
+
+    photo = user.get(
+        "profile_photo_file_id"
+    )
+
+    markup = profile_keyboard()
+
+    if photo:
+
+        result = send_photo(
+            user_id,
+            photo,
+            text,
+            markup,
+            protect=True
+        )
+
+        if not result or not result.get("ok"):
+
+            send_message(
+                user_id,
+                text,
+                markup,
+                protect=True
+            )
+
+    else:
+
+        send_message(
+            user_id,
+            text,
+            markup,
+            protect=True
+        )
+
+
+# =========================================================
+# ADSGRAM
+# =========================================================
+
+def get_adsgram_ad(user_id):
+
+    if not ADSGRAM_TOKEN:
+
+        print("ADSGRAM_TOKEN is missing.")
         return None
 
     try:
-        r=requests.get(
-            'https://api.adsgram.ai/advbot',
+
+        response = requests.get(
+            "https://api.adsgram.ai/advbot",
             params={
-                'tgid':uid,
-                'blockid':BLOCK_ID,
-                'language':'en',
-                'token':ADS_TOKEN
+                "tgid": user_id,
+                "blockid": ADSGRAM_BLOCK_ID,
+                "language": "en",
+                "token": ADSGRAM_TOKEN
             },
             timeout=20
         )
 
-        return r.json() if r.status_code==200 else None
+        print(
+            "AdsGram status:",
+            response.status_code
+        )
 
-    except:
+        if response.status_code != 200:
+
+            print(
+                "AdsGram response:",
+                response.text[:500]
+            )
+
+            return None
+
+        data = response.json()
+
+        if not isinstance(data, dict):
+
+            return None
+
+        if not data.get("reward_url"):
+
+            print(
+                "AdsGram response has no reward_url."
+            )
+
+            return None
+
+        return data
+
+    except Exception as e:
+
+        print(
+            "AdsGram exception:",
+            e
+        )
+
         return None
 
-def pending(uid):
-    q(
-        'INSERT INTO pending_ads(user_id,created_at) '
-        'VALUES(%s,%s) '
-        'ON CONFLICT(user_id) '
-        'DO UPDATE SET created_at=EXCLUDED.created_at',
-        (uid,now())
-    )
 
-def consume(uid):
-    r=q(
-        'SELECT created_at FROM pending_ads WHERE user_id=%s',
-        (uid,),
-        True,
-        True
-    )
+def create_pending_ad(user_id):
 
-    if not r:
-        return False
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO pending_ads
+        (user_id, created_at)
+        VALUES (%s, %s)
+
+        ON CONFLICT (user_id)
+        DO UPDATE SET
+            created_at = EXCLUDED.created_at
+    """, (
+        user_id,
+        now()
+    ))
+
+    conn.commit()
+
+    cur.close()
+    conn.close()
+
+
+def reward_adsgram_user(user_id):
+
+    conn = db()
+    cur = conn.cursor()
 
     try:
-        created=datetime.strptime(
-            r[0]['created_at'],
-            '%Y-%m-%d %H:%M:%S'
-        )
 
-        if datetime.now()-created>timedelta(hours=1):
-            q(
-                'DELETE FROM pending_ads WHERE user_id=%s',
-                (uid,)
-            )
+        cur.execute("""
+            SELECT created_at
+            FROM pending_ads
+            WHERE user_id=%s
+            FOR UPDATE
+        """, (user_id,))
+
+        pending = cur.fetchone()
+
+        if not pending:
+
+            conn.rollback()
             return False
 
-    except:
-        return False
+        try:
 
-    q(
-        'DELETE FROM pending_ads WHERE user_id=%s',
-        (uid,)
-    )
+            created = datetime.strptime(
+                pending[0],
+                "%Y-%m-%d %H:%M:%S"
+            )
 
-    return True
+            if datetime.now() - created > timedelta(
+                hours=1
+            ):
 
-# =========================
-# DAILY TASKS
-# =========================
+                cur.execute(
+                    "DELETE FROM pending_ads WHERE user_id=%s",
+                    (user_id,)
+                )
 
-TASKS={
-    'bonus':'🎁 Daily Bonus',
-    'quiz':'🎯 Daily Quiz',
-    'checkin':'🪙 Coin Check-in',
-    'knowledge':'🌍 Daily Knowledge',
-    'world':'☀️ World Facts'
-}
+                conn.commit()
 
-QUESTIONS=[
-('q1','What is the capital of Bangladesh?',
- ['Dhaka','Sylhet','Rajshahi','Khulna'],0),
+                return False
 
-('q2','Which planet is called the Red Planet?',
- ['Mars','Venus','Jupiter','Mercury'],0),
+        except Exception:
+            pass
 
-('q3','How many days are in a leap year?',
- ['366','365','364','360'],0),
-
-('q4','Which is the largest ocean?',
- ['Pacific','Atlantic','Indian','Arctic'],0),
-
-('q5','How many continents are there?',
- ['7','5','6','8'],0),
-
-('q6','What is H2O?',
- ['Water','Oxygen','Hydrogen','Salt'],0),
-
-('q7','Which animal is the fastest on land?',
- ['Cheetah','Tiger','Horse','Lion'],0),
-
-('q8','Which country is famous for Mount Fuji?',
- ['Japan','China','India','Nepal'],0),
-
-('q9','Which country has the Taj Mahal?',
- ['India','Pakistan','Nepal','Sri Lanka'],0),
-
-('q10','Which country is famous for the Eiffel Tower?',
- ['France','Italy','Spain','Germany'],0),
-
-('q11','What is 10 + 15?',
- ['25','20','30','35'],0),
-
-('q12','Which organ pumps blood?',
- ['Heart','Liver','Lung','Kidney'],0),
-
-('q13','How many minutes are in an hour?',
- ['60','30','90','100'],0),
-
-('q14','Which planet is closest to the Sun?',
- ['Mercury','Venus','Earth','Mars'],0),
-
-('q15','Which is the largest mammal?',
- ['Blue whale','Elephant','Giraffe','Hippo'],0),
-
-('q16','Which country is famous for kangaroos?',
- ['Australia','Brazil','Canada','Kenya'],0),
-
-('q17','What is the freezing point of water?',
- ['0°C','10°C','32°C','100°C'],0),
-
-('q18','Which instrument has black and white keys?',
- ['Piano','Flute','Drum','Guitar'],0),
-
-('q19','Which country is famous for the pyramids of Giza?',
- ['Egypt','Greece','Turkey','Jordan'],0),
-
-('q20','Which planet do we live on?',
- ['Earth','Mars','Venus','Jupiter'],0)
-]
-
-FACTS=[
-'🌍 Bangladesh is in South Asia.',
-'🌊 The Pacific Ocean is the largest ocean on Earth.',
-'☀️ The Sun is a star.',
-'🌙 The Moon is Earth’s natural satellite.',
-'🐘 Elephants are the largest land animals.',
-'🐝 Bees help pollinate many plants.',
-'🌳 Trees absorb carbon dioxide.',
-'💧 Water is essential for life.',
-'🗺️ Asia is the largest continent.',
-'🦒 Giraffes can reach leaves high in trees.'
-]
-
-def claimed(uid,k):
-    return bool(
-        q(
-            'SELECT 1 FROM daily_task_claims '
-            'WHERE user_id=%s AND task_key=%s AND claim_date=%s',
-            (uid,k,today()),
-            False,
-            True
-        )
-    )
-
-def claim(uid,k):
-    if k not in TASKS or claimed(uid,k):
-        return False
-
-    r=setting('task_reward',5)
-
-    try:
-        q(
-            'INSERT INTO daily_task_claims'
-            '(user_id,task_key,claim_date,reward,created_at) '
-            'VALUES(%s,%s,%s,%s,%s)',
-            (uid,k,today(),r,now())
+        cur.execute(
+            "DELETE FROM pending_ads WHERE user_id=%s",
+            (user_id,)
         )
 
-        q(
-            'UPDATE user_stats '
-            'SET task_completed=task_completed+1 '
-            'WHERE user_id=%s',
-            (uid,)
-        )
+        if cur.rowcount != 1:
 
-        add(
-            uid,
-            r,
-            f'Daily Task: {TASKS[k]}'
-        )
+            conn.rollback()
+            return False
+
+        cur.execute("""
+            UPDATE users
+            SET
+                coins = coins + %s,
+                coins_earned = coins_earned + %s,
+                ads_watched = ads_watched + 1
+            WHERE user_id=%s
+        """, (
+            AD_REWARD,
+            AD_REWARD,
+            user_id
+        ))
+
+        if cur.rowcount != 1:
+
+            conn.rollback()
+            return False
+
+        cur.execute("""
+            INSERT INTO history
+            (
+                user_id,
+                amount,
+                reason,
+                created_at
+            )
+            VALUES (%s, %s, %s, %s)
+        """, (
+            user_id,
+            AD_REWARD,
+            "AdsGram Ad Reward",
+            now()
+        ))
+
+        conn.commit()
 
         return True
 
-    except:
+    except Exception as e:
+
+        conn.rollback()
+
+        print(
+            "Reward error:",
+            e
+        )
+
         return False
 
-def question(uid):
-    used={
-        x['question_key']
-        for x in q(
-            'SELECT question_key FROM quiz_attempts '
-            'WHERE user_id=%s',
-            (uid,),
-            True,
-            True
+    finally:
+
+        cur.close()
+        conn.close()
+
+
+# =========================================================
+# UPDATE HANDLER
+# =========================================================
+
+def handle_update(update):
+
+    # -----------------------------------------------------
+    # CALLBACK QUERY
+    # -----------------------------------------------------
+
+    if "callback_query" in update:
+
+        callback = update["callback_query"]
+
+        callback_id = callback["id"]
+        data = callback.get("data", "")
+
+        sender = callback.get("from", {})
+
+        user_id = sender.get("id")
+
+        if not user_id:
+            return
+
+        username = sender.get(
+            "username"
         )
-    }
 
-    available=[
-        x for x in QUESTIONS
-        if x[0] not in used
-    ] or QUESTIONS
-
-    i=int(
-        hashlib.sha256(
-            f'{uid}:{today()}'.encode()
-        ).hexdigest(),
-        16
-    )%len(available)
-
-    return available[i]
-
-def tasktext(uid):
-    r=setting('task_reward',5)
-
-    return (
-        '📋 Daily Tasks\n\n'
-        +
-        '\n'.join(
-            ('✅' if claimed(uid,k) else '⬜')
-            +
-            f' {v} — {r} Coins'
-            for k,v in TASKS.items()
+        create_user(
+            user_id,
+            username
         )
-        +
-        f'\n\n💰 Maximum: {r*5} Coins/day'
-    )
 
-def taskmark():
-    return {
-        'inline_keyboard':[
-            [
-                {
-                    'text':'🎁 Daily Bonus',
-                    'callback_data':'task:bonus'
-                }
-            ],
-            [
-                {
-                    'text':'🎯 Daily Quiz',
-                    'callback_data':'task:quiz'
-                }
-            ],
-            [
-                {
-                    'text':'🪙 Coin Check-in',
-                    'callback_data':'task:checkin'
-                }
-            ],
-            [
-                {
-                    'text':'🌍 Daily Knowledge',
-                    'callback_data':'task:knowledge'
-                }
-            ],
-            [
-                {
-                    'text':'☀️ World Facts',
-                    'callback_data':'task:world'
-                }
-            ]
-        ]
-    }
+        update_last_seen(
+            user_id
+        )
 
-def profile(uid):
-    u=user(uid)
+        user = get_user(user_id)
 
-    s=q(
-        'SELECT task_completed,daily_streak '
-        'FROM user_stats WHERE user_id=%s',
-        (uid,),
-        False,
-        True
-    )
+        if user and user["blocked"]:
 
-    s=s[0] if s else {
-        'task_completed':0,
-        'daily_streak':0
-    }
+            answer_callback(
+                callback_id,
+                "🚫 Your account is blocked."
+            )
 
-    return (
-        f"👤 My Profile\n\n"
-        f"🆔 {uid}\n"
-        f"🪙 Coins: {u['coins']:,}\n"
-        f"📺 Ads: {u['ads_watched']:,}\n"
-        f"📋 Tasks: {s['task_completed']:,}\n"
-        f"🔥 Streak: {s['daily_streak']:,}\n"
-        f"📈 Earned: {u['coins_earned']:,}"
-    )
+            return
 
-# =========================
-# SHOP
-# =========================
+        message = callback.get(
+            "message",
+            {}
+        )
 
-def shop():
-    return q(
-        'SELECT * FROM shop_items '
-        'WHERE active=1 ORDER BY id',
-        (),
-        True,
-        True
-    )
+        message_id = message.get(
+            "message_id"
+        )
 
-def shopmark():
-    return {
-        'inline_keyboard':[
-            [
-                {
-                    'text':f"{x['name']} — {x['price']:,}",
-                    'callback_data':f"shop:{x['id']}"
-                }
-            ]
-            for x in shop()
-        ]
-    }
+        # -------------------------------------------------
+        # PROFILE
+        # -------------------------------------------------
 
-# =========================
-# CALLBACKS
-# =========================
+        if data == "profile":
 
-def callback(u):
-    c=u['callback_query']
-    uid=c['from']['id']
-    data=c.get('data','')
+            answer_callback(
+                callback_id
+            )
 
-    ensure(
-        uid,
-        c['from'].get('username')
-    )
+            show_profile(
+                user_id
+            )
 
-    answer(c['id'])
+            return
 
-    if user(uid)['blocked']:
-        return
+        if data == "profile_name":
 
-    if data.startswith('task:'):
+            set_profile_state(
+                user_id,
+                "name"
+            )
 
-        k=data.split(':',1)[1]
+            answer_callback(
+                callback_id
+            )
 
-        if k=='bonus':
+            send_message(
+                user_id,
+                "✏️ তোমার নতুন Profile Name পাঠাও।\n\n"
+                "সর্বোচ্চ 40 characters ব্যবহার করো।"
+            )
 
-            if user(uid)['last_bonus']!=today():
+            return
 
-                r=setting(
-                    'daily_bonus',
-                    5
+        if data == "profile_photo":
+
+            set_profile_state(
+                user_id,
+                "photo"
+            )
+
+            answer_callback(
+                callback_id
+            )
+
+            send_message(
+                user_id,
+                "📷 এখন একটি Photo পাঠাও।\n\n"
+                "Photo পাঠালেই সেটি তোমার Profile Photo হিসেবে Save হবে।"
+            )
+
+            return
+
+        if data == "badge_shop":
+
+            answer_callback(
+                callback_id
+            )
+
+            show_badge_shop(
+                user_id
+            )
+
+            return
+
+        if data.startswith("buy_badge:"):
+
+            badge_key = data.split(
+                ":",
+                1
+            )[1]
+
+            buy_badge(
+                user_id,
+                badge_key,
+                callback_id
+            )
+
+            return
+
+        # -------------------------------------------------
+        # DAILY BONUS TASK
+        # -------------------------------------------------
+
+        if data == "task:daily_bonus":
+
+            if task_claimed(
+                user_id,
+                "daily_bonus"
+            ):
+
+                answer_callback(
+                    callback_id,
+                    "আজকের Daily Bonus Task সম্পন্ন।"
                 )
 
-                q(
-                    'UPDATE users '
-                    'SET coins=coins+%s,'
-                    'coins_earned=coins_earned+%s,'
-                    'last_bonus=%s '
-                    'WHERE user_id=%s',
-                    (r,r,today(),uid)
+                return
+
+            user = get_user(
+                user_id
+            )
+
+            today_string = str(
+                today()
+            )
+
+            if user["last_bonus"] == today_string:
+
+                success = claim_task(
+                    user_id,
+                    "daily_bonus",
+                    "Daily Bonus Task"
                 )
 
-                hist(
-                    uid,
-                    r,
-                    'Daily bonus'
+                if success:
+
+                    answer_callback(
+                        callback_id,
+                        "+5 Coins!"
+                    )
+
+                else:
+
+                    answer_callback(
+                        callback_id,
+                        "Task ইতিমধ্যে সম্পন্ন।"
+                    )
+
+            else:
+
+                conn = db()
+                cur = conn.cursor()
+
+                cur.execute("""
+                    UPDATE users
+                    SET
+                        coins = coins + %s,
+                        coins_earned = coins_earned + %s,
+                        last_bonus = %s
+                    WHERE user_id=%s
+                    AND (
+                        last_bonus IS NULL
+                        OR last_bonus <> %s
+                    )
+                """, (
+                    DAILY_BONUS,
+                    DAILY_BONUS,
+                    today_string,
+                    user_id,
+                    today_string
+                ))
+
+                changed = cur.rowcount
+
+                conn.commit()
+
+                cur.close()
+                conn.close()
+
+                if changed:
+
+                    add_history(
+                        user_id,
+                        DAILY_BONUS,
+                        "Daily bonus"
+                    )
+
+                claim_task(
+                    user_id,
+                    "daily_bonus",
+                    "Daily Bonus Task"
                 )
 
-                claim(uid,'bonus')
+                answer_callback(
+                    callback_id,
+                    "🎁 Daily Bonus +20 + Task +5"
+                )
 
-                send(
-                    uid,
-                    f'🎁 Daily Bonus Claimed!\n\n+{r} Coins added.'
+            show_daily_tasks(
+                user_id,
+                message_id
+            )
+
+            return
+
+        # -------------------------------------------------
+        # DAILY QUIZ
+        # -------------------------------------------------
+
+        if data == "task:daily_quiz":
+
+            if task_claimed(
+                user_id,
+                "daily_quiz"
+            ):
+
+                answer_callback(
+                    callback_id,
+                    "আজকের Quiz সম্পন্ন।"
+                )
+
+                return
+
+            answer_callback(
+                callback_id
+            )
+
+            show_quiz(
+                user_id,
+                message_id
+            )
+
+            return
+
+        # -------------------------------------------------
+        # COIN CHECK-IN
+        # -------------------------------------------------
+
+        if data == "task:coin_checkin":
+
+            if task_claimed(
+                user_id,
+                "coin_checkin"
+            ):
+
+                answer_callback(
+                    callback_id,
+                    "আজকের Check-in সম্পন্ন।"
+                )
+
+                return
+
+            success = claim_task(
+                user_id,
+                "coin_checkin",
+                "Daily Coin Check-in"
+            )
+
+            if success:
+
+                answer_callback(
+                    callback_id,
+                    "🪙 +5 Coins!"
+                )
+
+                send_message(
+                    user_id,
+                    "🪙 Coin Check-in Complete!\n\n"
+                    "+5 Coins যোগ হয়েছে।"
                 )
 
             else:
-                claim(uid,'bonus')
-                send(
-                    uid,
-                    "⏳ Today's bonus is already claimed."
+
+                answer_callback(
+                    callback_id,
+                    "আজকের Check-in ইতিমধ্যে নেওয়া হয়েছে।"
                 )
 
-            send(
-                uid,
-                tasktext(uid),
-                taskmark()
+            show_daily_tasks(
+                user_id,
+                message_id
             )
 
             return
 
-        if k=='quiz':
+        # -------------------------------------------------
+        # DAILY KNOWLEDGE
+        # -------------------------------------------------
 
-            if claimed(uid,'quiz'):
-                send(
-                    uid,
-                    "🎯 Today's quiz is already completed."
+        if data == "task:daily_knowledge":
+
+            if task_claimed(
+                user_id,
+                "daily_knowledge"
+            ):
+
+                answer_callback(
+                    callback_id,
+                    "আজকের Knowledge Task সম্পন্ন।"
                 )
+
                 return
 
-            z=question(uid)
+            answer_callback(
+                callback_id
+            )
 
-            send(
-                uid,
-                '🎯 Daily Quiz\n\n'+z[1],
-                {
-                    'inline_keyboard':[
-                        [
-                            {
-                                'text':a,
-                                'callback_data':
-                                f'quiz:{z[0]}:{i}'
-                            }
-                        ]
-                        for i,a in enumerate(z[2])
-                    ]
-                }
+            show_general_quiz(
+                user_id,
+                "daily_knowledge",
+                "📚 Daily Knowledge",
+                KNOWLEDGE_QUESTIONS,
+                message_id
             )
 
             return
 
-        if k=='checkin':
+        # -------------------------------------------------
+        # WORLD FACTS
+        # -------------------------------------------------
 
-            if claimed(uid,'checkin'):
-                send(
-                    uid,
-                    "🪙 Today's check-in is already completed."
+        if data == "task:world_facts":
+
+            if task_claimed(
+                user_id,
+                "world_facts"
+            ):
+
+                answer_callback(
+                    callback_id,
+                    "আজকের World Facts Task সম্পন্ন।"
                 )
+
                 return
 
-            s=q(
-                'SELECT last_checkin,daily_streak '
-                'FROM user_stats WHERE user_id=%s',
-                (uid,),
-                True,
-                True
+            answer_callback(
+                callback_id
             )
 
-            s=s[0] if s else {
-                'last_checkin':None,
-                'daily_streak':0
-            }
-
-            yesterday=(
-                date.today()-timedelta(1)
-            ).isoformat()
-
-            st=(
-                s['daily_streak']+1
-                if s['last_checkin']==yesterday
-                else 1
-            )
-
-            q(
-                'UPDATE user_stats '
-                'SET last_checkin=%s,daily_streak=%s '
-                'WHERE user_id=%s',
-                (today(),st,uid)
-            )
-
-            claim(uid,'checkin')
-
-            send(
-                uid,
-                f'🪙 Check-in complete!\n🔥 Streak: {st} day(s)'
-            )
-
-            send(
-                uid,
-                tasktext(uid),
-                taskmark()
+            show_general_quiz(
+                user_id,
+                "world_facts",
+                "🌍 World Facts",
+                WORLD_FACTS_QUESTIONS,
+                message_id
             )
 
             return
 
-        if k in ('knowledge','world'):
+        # -------------------------------------------------
+        # MCQ ANSWERS
+        # -------------------------------------------------
 
-            if claimed(uid,k):
-                send(
-                    uid,
-                    "⏳ Today's task is already completed."
+        if data.startswith("mcq:"):
+
+            try:
+
+                parts = data.split(":")
+
+                task_key = parts[1]
+                question_id = int(parts[2])
+                selected = int(parts[3])
+
+                if task_key == "daily_knowledge":
+
+                    handle_general_mcq(
+                        user_id,
+                        callback_id,
+                        message_id,
+                        task_key,
+                        question_id,
+                        selected,
+                        KNOWLEDGE_QUESTIONS,
+                        "📚 Daily Knowledge"
+                    )
+
+                elif task_key == "world_facts":
+
+                    handle_general_mcq(
+                        user_id,
+                        callback_id,
+                        message_id,
+                        task_key,
+                        question_id,
+                        selected,
+                        WORLD_FACTS_QUESTIONS,
+                        "🌍 World Facts"
+                    )
+
+                else:
+
+                    answer_callback(
+                        callback_id,
+                        "Invalid task."
+                    )
+
+            except Exception as e:
+
+                print(
+                    "MCQ error:",
+                    e
                 )
-                return
 
-            f=FACTS[
-                int(
-                    hashlib.sha256(
-                        f'{uid}:{today()}:{k}'.encode()
-                    ).hexdigest(),
-                    16
-                )%len(FACTS)
-            ]
-
-            claim(uid,k)
-
-            send(
-                uid,
-                (
-                    '🌍 Daily Knowledge'
-                    if k=='knowledge'
-                    else '☀️ World Facts'
+                answer_callback(
+                    callback_id,
+                    "Task-এ সমস্যা হয়েছে।"
                 )
-                +
-                '\n\n'+f+
-                '\n\n✅ Task completed.',
-                taskmark()
-            )
 
             return
-
-    if data.startswith('quiz:'):
-
-        _,key,ans=data.split(':')
-        ans=int(ans)
-
-        z=next(
-            (x for x in QUESTIONS if x[0]==key),
-            None
-        )
-
-        if (
-            claimed(uid,'quiz')
-            or
-            q(
-                'SELECT 1 FROM quiz_attempts '
-                'WHERE user_id=%s AND attempt_date=%s',
-                (uid,today()),
-                False,
-                True
-            )
-        ):
-            send(
-                uid,
-                "🎯 Today's quiz is already completed."
-            )
-            return
-
-        if not z:
-            return
-
-        ok=int(ans==z[3])
-
-        q(
-            'INSERT INTO quiz_attempts'
-            '(user_id,question_key,attempt_date,correct,created_at) '
-            'VALUES(%s,%s,%s,%s,%s)',
-            (uid,key,today(),ok,now())
-        )
-
-        if ok:
-            claim(uid,'quiz')
-
-            send(
-                uid,
-                f"🎉 Correct! +{setting('task_reward',5)} Coins"
-            )
-        else:
-            send(
-                uid,
-                f"❌ Wrong answer. "
-                f"Correct answer: {z[2][z[3]]}"
-            )
-
-        send(
-            uid,
-            tasktext(uid),
-            taskmark()
-        )
 
         return
 
-    if data.startswith('shop:'):
+    # -----------------------------------------------------
+    # NORMAL MESSAGE
+    # -----------------------------------------------------
 
-        iid=int(data.split(':')[1])
-
-        r=q(
-            'SELECT * FROM shop_items '
-            'WHERE id=%s AND active=1',
-            (iid,),
-            True,
-            True
-        )
-
-        item=r[0] if r else None
-
-        if not item:
-            send(uid,'❌ Item unavailable.')
-            return
-
-        if user(uid)['coins']<item['price']:
-            send(uid,'❌ Not enough Coins.')
-            return
-
-        changed=q(
-            'UPDATE users '
-            'SET coins=coins-%s '
-            'WHERE user_id=%s AND coins>=%s',
-            (
-                item['price'],
-                uid,
-                item['price']
-            )
-        )
-
-        if changed!=1:
-            send(
-                uid,
-                '❌ Balance changed. Please try again.'
-            )
-            return
-
-        r=q(
-            "INSERT INTO shop_purchases"
-            "(user_id,item_id,item_name,price,status,created_at) "
-            "VALUES(%s,%s,%s,%s,'pending',%s) "
-            "RETURNING id",
-            (
-                uid,
-                iid,
-                item['name'],
-                item['price'],
-                now()
-            ),
-            True,
-            True
-        )
-
-        pid=r[0]['id']
-
-        hist(
-            uid,
-            -item['price'],
-            f"Shop purchase pending: {item['name']}"
-        )
-
-        send(
-            uid,
-            f'🛍️ Purchase #{pid} submitted.\n'
-            'Coins are reserved until admin decision.'
-        )
-
-        send(
-            ADMIN_ID,
-            f"🛍️ NEW SHOP PURCHASE #{pid}\n"
-            f"User: {uid}\n"
-            f"Item: {item['name']}\n"
-            f"Price: {item['price']:,} Coins"
-        )
-
+    if "message" not in update:
         return
 
-# =========================
-# NORMAL MESSAGES
-# =========================
+    message = update["message"]
 
-def message(u):
-
-    m=u['message']
-    s=m.get('from',{})
-    uid=s.get('id')
-    t=(m.get('text') or '').strip()
-
-    if not uid:
+    if "from" not in message:
         return
 
-    ensure(
-        uid,
-        s.get('username')
+    sender = message["from"]
+
+    user_id = sender["id"]
+
+    username = sender.get(
+        "username"
     )
 
-    U=user(uid)
+    text = message.get(
+        "text",
+        ""
+    ).strip()
 
-    if U['blocked']:
-        send(
-            uid,
-            '🚫 Your account is currently blocked.'
-        )
-        return
+    create_user(
+        user_id,
+        username
+    )
 
-    if t.startswith('/start'):
+    update_last_seen(
+        user_id
+    )
 
-        p=t.split()
+    user = get_user(user_id)
 
-        if len(p)>1:
-            try:
-                ref=int(p[1])
-                r=user(ref)
+    if user and user["blocked"]:
 
-                if (
-                    ref!=uid
-                    and r
-                    and U['referred_by'] is None
-                    and U['coins']==0
-                    and U['ads_watched']==0
-                ):
-                    q(
-                        'UPDATE users '
-                        'SET referred_by=%s '
-                        'WHERE user_id=%s',
-                        (ref,uid)
-                    )
-
-                    bonus=setting(
-                        'referral_bonus',
-                        100
-                    )
-
-                    add(
-                        ref,
-                        bonus,
-                        'Referral bonus'
-                    )
-
-                    send(
-                        ref,
-                        f'🎉 Referral Bonus! '
-                        f'+{bonus} Coins'
-                    )
-
-            except:
-                pass
-
-        send(
-            uid,
-            '🎁 Welcome to Found Coins!\n\n'
-            '🪙 Earn Coins through tasks, quizzes, '
-            'check-ins, referrals and optional ads.\n\n'
-            '💰 10,000 Coins = ৳100',
-            menu()
+        send_message(
+            user_id,
+            "🚫 Your account is currently blocked."
         )
 
         return
 
-    if t=='🪙 My Coins':
+    # -----------------------------------------------------
+    # PROFILE INPUT: PHOTO
+    # -----------------------------------------------------
 
-        send(
-            uid,
-            f"🪙 Your Coins\n\n"
-            f"💰 Balance: {U['coins']:,}\n"
-            f"💵 Value: ৳{U['coins']/100:.2f}\n"
-            f"📺 Ads Watched: {U['ads_watched']:,}\n"
-            f"📈 Total Earned: {U['coins_earned']:,}",
-            menu()
+    profile_state = get_profile_state(
+        user_id
+    )
+
+    if profile_state == "photo":
+
+        photos = message.get(
+            "photo"
         )
 
-        return
+        if photos:
 
-    if t=='📺 Watch Ad':
+            largest = photos[-1]
 
-        a=ad(uid)
-
-        if not a:
-            send(
-                uid,
-                '📺 No ad is available right now.\n\n'
-                'Please try again later.',
-                menu()
+            file_id = largest.get(
+                "file_id"
             )
+
+            if file_id:
+
+                conn = db()
+                cur = conn.cursor()
+
+                cur.execute("""
+                    UPDATE users
+                    SET profile_photo_file_id=%s
+                    WHERE user_id=%s
+                """, (
+                    file_id,
+                    user_id
+                ))
+
+                conn.commit()
+
+                cur.close()
+                conn.close()
+
+                clear_profile_state(
+                    user_id
+                )
+
+                send_message(
+                    user_id,
+                    "✅ Profile Photo successfully updated!"
+                )
+
+                show_profile(
+                    user_id
+                )
+
+                return
+
+        send_message(
+            user_id,
+            "📷 একটি Photo পাঠাও।"
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # PROFILE INPUT: NAME
+    # -----------------------------------------------------
+
+    if profile_state == "name":
+
+        if text:
+
+            if len(text) > 40:
+
+                send_message(
+                    user_id,
+                    "❌ Name সর্বোচ্চ 40 characters হতে পারবে।"
+                )
+
+                return
+
+            safe_name = text.strip()
+
+            if not safe_name:
+
+                send_message(
+                    user_id,
+                    "❌ একটি valid name পাঠাও।"
+                )
+
+                return
+
+            conn = db()
+            cur = conn.cursor()
+
+            cur.execute("""
+                UPDATE users
+                SET profile_name=%s
+                WHERE user_id=%s
+            """, (
+                safe_name,
+                user_id
+            ))
+
+            conn.commit()
+
+            cur.close()
+            conn.close()
+
+            clear_profile_state(
+                user_id
+            )
+
+            send_message(
+                user_id,
+                "✅ Profile Name successfully updated!"
+            )
+
+            show_profile(
+                user_id
+            )
+
             return
 
-        pending(uid)
-
-        k=[]
-
-        if a.get('click_url'):
-            k.append([
-                {
-                    'text':a.get(
-                        'button_name',
-                        '▶️ Open Ad'
-                    ),
-                    'url':a['click_url']
-                }
-            ])
-
-        if a.get('reward_url'):
-            k.append([
-                {
-                    'text':a.get(
-                        'button_reward_name',
-                        '🎁 Continue'
-                    ),
-                    'url':a['reward_url']
-                }
-            ])
-
-        cap=(
-            a.get('text_html')
-            or
-            a.get('text')
-            or
-            'Sponsored advertisement'
+        send_message(
+            user_id,
+            "✏️ একটি নাম পাঠাও।"
         )
 
-        mark={
-            'inline_keyboard':k
+        return
+
+    # -----------------------------------------------------
+    # START
+    # -----------------------------------------------------
+
+    if text.startswith("/start"):
+
+        parts = text.split()
+
+        referred_by = None
+
+        if len(parts) > 1:
+
+            try:
+                referred_by = int(
+                    parts[1]
+                )
+
+            except Exception:
+                referred_by = None
+
+        if (
+            referred_by
+            and referred_by != user_id
+        ):
+
+            existing = get_user(
+                user_id
+            )
+
+            ref_user = get_user(
+                referred_by
+            )
+
+            if (
+                ref_user
+                and existing
+                and existing["referred_by"] is None
+            ):
+
+                conn = db()
+                cur = conn.cursor()
+
+                cur.execute("""
+                    UPDATE users
+                    SET referred_by=%s
+                    WHERE user_id=%s
+                    AND referred_by IS NULL
+                """, (
+                    referred_by,
+                    user_id
+                ))
+
+                changed = cur.rowcount
+
+                conn.commit()
+
+                cur.close()
+                conn.close()
+
+                if changed:
+
+                    add_coins(
+                        referred_by,
+                        REFERRAL_BONUS,
+                        "Referral bonus"
+                    )
+
+                    send_message(
+                        referred_by,
+                        f"🎉 You earned "
+                        f"{REFERRAL_BONUS} Coins "
+                        f"from a new referral!"
+                    )
+
+        send_message(
+            user_id,
+            "🎉 Welcome to Found Coins!\n\n"
+            "🪙 Earn Coins by completing available tasks.\n\n"
+            f"💰 {MIN_WITHDRAW:,} Coins = ৳100",
+            main_menu()
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # MY COINS
+    # -----------------------------------------------------
+
+    if text == "🪙 My Coins":
+
+        user = get_user(
+            user_id
+        )
+
+        send_message(
+            user_id,
+            f"🪙 Your Coins: "
+            f"{user['coins']:,}\n\n"
+            f"📺 Ads Watched: "
+            f"{user['ads_watched']:,}\n"
+            f"💰 Coins Earned: "
+            f"{user['coins_earned']:,}\n\n"
+            f"💵 10,000 Coins = ৳100",
+            main_menu()
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # MY PROFILE
+    # -----------------------------------------------------
+
+    if text == "👤 My Profile":
+
+        show_profile(
+            user_id
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # DAILY TASKS
+    # -----------------------------------------------------
+
+    if text == "📋 Daily Tasks":
+
+        show_daily_tasks(
+            user_id
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # WATCH AD
+    # -----------------------------------------------------
+
+    if text == "📺 Watch Ad":
+
+        ad = get_adsgram_ad(
+            user_id
+        )
+
+        if not ad:
+
+            send_message(
+                user_id,
+                "📺 No ad is available right now.\n\n"
+                "Please try again later.",
+                main_menu()
+            )
+
+            return
+
+        create_pending_ad(
+            user_id
+        )
+
+        text_html = (
+            ad.get("text_html")
+            or ad.get("text")
+            or "📺 Sponsored advertisement."
+        )
+
+        click_url = ad.get(
+            "click_url"
+        )
+
+        reward_url = ad.get(
+            "reward_url"
+        )
+
+        button_name = (
+            ad.get("button_name")
+            or "▶️ Open Ad"
+        )
+
+        reward_button_name = (
+            ad.get("button_reward_name")
+            or "🎁 Claim Reward"
+        )
+
+        keyboard = []
+
+        if click_url:
+
+            keyboard.append([
+                {
+                    "text": button_name,
+                    "url": click_url
+                }
+            ])
+
+        if reward_url:
+
+            keyboard.append([
+                {
+                    "text": reward_button_name,
+                    "url": reward_url
+                }
+            ])
+
+        markup = {
+            "inline_keyboard": keyboard
         }
 
-        if a.get('image_url'):
+        image_url = ad.get(
+            "image_url"
+        )
 
-            z=tg(
-                'sendPhoto',
+        if image_url:
+
+            result = telegram(
+                "sendPhoto",
                 {
-                    'chat_id':uid,
-                    'photo':a['image_url'],
-                    'caption':cap,
-                    'parse_mode':'HTML',
-                    'reply_markup':mark,
-                    'protect_content':True
+                    "chat_id": user_id,
+                    "photo": image_url,
+                    "caption": text_html,
+                    "parse_mode": "HTML",
+                    "reply_markup": markup,
+                    "protect_content": True
                 }
             )
 
-            if not z or not z.get('ok'):
-                send(
-                    uid,
-                    cap,
-                    mark,
-                    True,
-                    'HTML'
+            if not result or not result.get("ok"):
+
+                send_message(
+                    user_id,
+                    text_html,
+                    markup,
+                    protect=True,
+                    parse_mode="HTML"
                 )
 
         else:
-            send(
-                uid,
-                cap,
-                mark,
-                True,
-                'HTML'
+
+            send_message(
+                user_id,
+                text_html,
+                markup,
+                protect=True,
+                parse_mode="HTML"
             )
 
         return
 
-    if t=='🎁 Daily Bonus':
+    # -----------------------------------------------------
+    # DAILY BONUS
+    # -----------------------------------------------------
 
-        if U['last_bonus']==today():
-            send(
-                uid,
-                "⏳ You already claimed today's bonus."
-            )
-            return
+    if text == "🎁 Daily Bonus":
 
-        r=setting(
-            'daily_bonus',
-            5
+        user = get_user(
+            user_id
         )
 
-        q(
-            'UPDATE users '
-            'SET coins=coins+%s,'
-            'coins_earned=coins_earned+%s,'
-            'last_bonus=%s '
-            'WHERE user_id=%s',
-            (r,r,today(),uid)
+        today_string = str(
+            today()
         )
 
-        hist(
-            uid,
-            r,
-            'Daily bonus'
-        )
+        if user["last_bonus"] == today_string:
 
-        claim(
-            uid,
-            'bonus'
-        )
-
-        send(
-            uid,
-            f'🎁 Daily Bonus Claimed!\n\n'
-            f'+{r} Coins added.',
-            menu()
-        )
-
-        return
-
-    if t=='📋 Daily Tasks':
-        send(
-            uid,
-            tasktext(uid),
-            taskmark()
-        )
-        return
-
-    if t=='👤 My Profile':
-        send(
-            uid,
-            profile(uid),
-            menu()
-        )
-        return
-
-    if t=='🛍️ Coin Shop':
-
-        xs=shop()
-
-        if xs:
-            text=(
-                '🛍️ Coin Shop\n\n'
-                +
-                '\n'.join(
-                    f"• {x['name']} — "
-                    f"{x['price']:,} Coins\n"
-                    f"  {x['description']}"
-                    for x in xs
-                )
-            )
-
-            send(
-                uid,
-                text,
-                shopmark()
-            )
-
-        else:
-            send(
-                uid,
-                '🛍️ Coin Shop\n\n'
-                'No items available.',
-                menu()
-            )
-
-        return
-
-    if t=='👥 Referral':
-
-        bonus=setting(
-            'referral_bonus',
-            100
-        )
-
-        send(
-            uid,
-            f'👥 Referral Program\n\n'
-            f'Earn {bonus} Coins per successful referral.\n\n'
-            f'🔗 https://t.me/FoundCoinsBot?start={uid}'
-        )
-
-        return
-
-    if t=='🏆 Leaderboard':
-
-        xs=q(
-            'SELECT username,user_id,coins '
-            'FROM users '
-            'WHERE blocked=0 '
-            'ORDER BY coins DESC '
-            'LIMIT 10',
-            (),
-            True,
-            True
-        )
-
-        text='🏆 Top 10 Leaderboard\n\n'
-
-        if xs:
-            text+='\n'.join(
-                f"{i}. "
-                f"@{x['username'] if x['username'] else x['user_id']} "
-                f"— {x['coins']:,}"
-                for i,x in enumerate(xs,1)
-            )
-        else:
-            text+='No users yet.'
-
-        send(uid,text)
-        return
-
-    if t=='📜 History':
-
-        xs=q(
-            'SELECT amount,reason,created_at '
-            'FROM history '
-            'WHERE user_id=%s '
-            'ORDER BY id DESC '
-            'LIMIT 10',
-            (uid,),
-            True,
-            True
-        )
-
-        if xs:
-            text='📜 Your Recent History\n\n'
-
-            for x in xs:
-                sign='+' if x['amount']>=0 else ''
-
-                text+=(
-                    f"{sign}{x['amount']} — "
-                    f"{x['reason']}\n"
-                    f"{x['created_at']}\n\n"
-                )
-        else:
-            text='📜 Your Recent History\n\nNo history yet.'
-
-        send(uid,text)
-        return
-
-    if t=='💰 Withdraw':
-
-        if U['coins']<MIN_W:
-
-            send(
-                uid,
-                f'💰 Withdrawal\n\n'
-                f'Your Coins: {U["coins"]:,}\n'
-                f'Minimum: {MIN_W:,} Coins\n'
-                f'Value: ৳100\n\n'
-                f'❌ Need {MIN_W-U["coins"]:,} more Coins.'
+            send_message(
+                user_id,
+                "⏳ You already claimed "
+                "today's bonus.\n\n"
+                "Come back tomorrow.",
+                main_menu()
             )
 
             return
 
-        send(
-            uid,
-            '💰 Withdrawal\n\n'
-            'Send:\n\n'
-            'bKash: 01XXXXXXXXX\n'
-            'Nagad: 01XXXXXXXXX'
+        conn = db()
+        cur = conn.cursor()
+
+        cur.execute("""
+            UPDATE users
+            SET
+                coins = coins + %s,
+                coins_earned = coins_earned + %s,
+                last_bonus = %s
+            WHERE user_id=%s
+            AND (
+                last_bonus IS NULL
+                OR last_bonus <> %s
+            )
+        """, (
+            DAILY_BONUS,
+            DAILY_BONUS,
+            today_string,
+            user_id,
+            today_string
+        ))
+
+        changed = cur.rowcount
+
+        conn.commit()
+
+        cur.close()
+        conn.close()
+
+        if changed:
+
+            add_history(
+                user_id,
+                DAILY_BONUS,
+                "Daily bonus"
+            )
+
+            if not task_claimed(
+                user_id,
+                "daily_bonus"
+            ):
+
+                claim_task(
+                    user_id,
+                    "daily_bonus",
+                    "Daily Bonus Task"
+                )
+
+            send_message(
+                user_id,
+                f"🎁 Daily Bonus Claimed!\n\n"
+                f"+{DAILY_BONUS} Coins added.\n"
+                f"+{DAILY_TASK_REWARD} Daily Task Coins added.",
+                main_menu()
+            )
+
+        return
+
+    # -----------------------------------------------------
+    # REFERRAL
+    # -----------------------------------------------------
+
+    if text == "👥 Referral":
+
+        link = (
+            f"https://t.me/FoundCoinsBot"
+            f"?start={user_id}"
+        )
+
+        send_message(
+            user_id,
+            f"👥 Referral Program\n\n"
+            f"Invite friends and earn "
+            f"{REFERRAL_BONUS} Coins.\n\n"
+            f"🔗 Your Referral Link:\n"
+            f"{link}",
+            main_menu()
         )
 
         return
 
-    if t.lower().startswith(
-        ('bkash:','nagad:')
+    # -----------------------------------------------------
+    # LEADERBOARD
+    # -----------------------------------------------------
+
+    if text == "🏆 Leaderboard":
+
+        conn = db()
+
+        cur = conn.cursor(
+            cursor_factory=
+            psycopg2.extras.RealDictCursor
+        )
+
+        cur.execute("""
+            SELECT username, user_id, coins
+            FROM users
+            WHERE blocked=0
+            ORDER BY coins DESC
+            LIMIT 10
+        """)
+
+        rows = cur.fetchall()
+
+        cur.close()
+        conn.close()
+
+        result = (
+            "🏆 Top 10 Leaderboard\n\n"
+        )
+
+        if not rows:
+
+            result += "No users yet."
+
+        else:
+
+            for i, row in enumerate(
+                rows,
+                1
+            ):
+
+                name = (
+                    f"@{row['username']}"
+                    if row["username"]
+                    else str(row["user_id"])
+                )
+
+                result += (
+                    f"{i}. {name} — "
+                    f"{row['coins']:,} Coins\n"
+                )
+
+        send_message(
+            user_id,
+            result,
+            main_menu()
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # HISTORY
+    # -----------------------------------------------------
+
+    if text == "📜 History":
+
+        conn = db()
+
+        cur = conn.cursor(
+            cursor_factory=
+            psycopg2.extras.RealDictCursor
+        )
+
+        cur.execute("""
+            SELECT amount, reason, created_at
+            FROM history
+            WHERE user_id=%s
+            ORDER BY id DESC
+            LIMIT 10
+        """, (
+            user_id,
+        ))
+
+        rows = cur.fetchall()
+
+        cur.close()
+        conn.close()
+
+        result = (
+            "📜 Your Recent History\n\n"
+        )
+
+        if not rows:
+
+            result += "No history yet."
+
+        else:
+
+            for row in rows:
+
+                sign = (
+                    "+"
+                    if row["amount"] >= 0
+                    else ""
+                )
+
+                result += (
+                    f"{sign}{row['amount']} Coins — "
+                    f"{row['reason']}\n"
+                    f"{row['created_at']}\n\n"
+                )
+
+        send_message(
+            user_id,
+            result,
+            main_menu()
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # WITHDRAW
+    # -----------------------------------------------------
+
+    if text == "💰 Withdraw":
+
+        user = get_user(
+            user_id
+        )
+
+        if user["coins"] < MIN_WITHDRAW:
+
+            remaining = (
+                MIN_WITHDRAW
+                - user["coins"]
+            )
+
+            send_message(
+                user_id,
+                f"💰 Withdrawal\n\n"
+                f"Your Coins: "
+                f"{user['coins']:,}\n"
+                f"Minimum: "
+                f"{MIN_WITHDRAW:,} Coins\n"
+                f"Value: ৳100\n\n"
+                f"❌ You need "
+                f"{remaining:,} more Coins.",
+                main_menu()
+            )
+
+            return
+
+        send_message(
+            user_id,
+            "💰 Withdrawal\n\n"
+            "You have enough Coins to withdraw ৳100.\n\n"
+            "Send one of these:\n\n"
+            "bKash: 01XXXXXXXXX\n"
+            "Nagad: 01XXXXXXXXX",
+            main_menu()
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # WITHDRAW REQUEST
+    # -----------------------------------------------------
+
+    if (
+        text.lower().startswith("bkash:")
+        or text.lower().startswith("nagad:")
     ):
 
-        p=t.split(':',1)
+        parts = text.split(
+            ":",
+            1
+        )
 
-        num=p[1].strip() if len(p)>1 else ''
+        if len(parts) != 2:
+            return
 
-        method=(
-            'bKash'
-            if p[0].lower()=='bkash'
-            else 'Nagad'
+        method = parts[0].strip().lower()
+        number = parts[1].strip()
+
+        method_name = (
+            "bKash"
+            if method == "bkash"
+            else "Nagad"
         )
 
         if (
-            len(num)!=11
-            or
-            not num.startswith('01')
-            or
-            not num.isdigit()
+            not number.isdigit()
+            or not number.startswith("01")
+            or len(number) != 11
         ):
-            send(
-                uid,
-                '❌ Invalid payment number.'
-            )
-            return
 
-        if U['coins']!=MAX_W:
-
-            send(
-                uid,
-                f'❌ Withdrawal is available '
-                f'at exactly {MAX_W:,} Coins.\n'
-                f'Your balance: {U["coins"]:,}'
+            send_message(
+                user_id,
+                "❌ Invalid payment number.\n\n"
+                "Example:\n"
+                "bKash: 01XXXXXXXXX",
+                main_menu()
             )
 
             return
 
-        if q(
-            "SELECT id FROM withdrawals "
-            "WHERE user_id=%s AND status='pending'",
-            (uid,),
-            False,
-            True
-        ):
-            send(
-                uid,
-                '⏳ You already have a pending withdrawal.'
+        user = get_user(
+            user_id
+        )
+
+        if user["coins"] < MAX_WITHDRAW:
+
+            send_message(
+                user_id,
+                f"❌ Withdrawal is available "
+                f"at {MAX_WITHDRAW:,} Coins.\n\n"
+                f"Your balance: "
+                f"{user['coins']:,} Coins.",
+                main_menu()
             )
+
             return
 
-        q(
-            "INSERT INTO withdrawals"
-            "(user_id,username,method,number,coins,status,created_at) "
-            "VALUES(%s,%s,%s,%s,%s,'pending',%s)",
+        conn = db()
+
+        cur = conn.cursor(
+            cursor_factory=
+            psycopg2.extras.RealDictCursor
+        )
+
+        cur.execute("""
+            SELECT id
+            FROM withdrawals
+            WHERE user_id=%s
+            AND status='pending'
+            LIMIT 1
+        """, (
+            user_id,
+        ))
+
+        existing = cur.fetchone()
+
+        if existing:
+
+            cur.close()
+            conn.close()
+
+            send_message(
+                user_id,
+                "⏳ You already have "
+                "a pending withdrawal.",
+                main_menu()
+            )
+
+            return
+
+        cur.execute("""
+            INSERT INTO withdrawals
             (
-                uid,
-                U['username'],
+                user_id,
+                username,
                 method,
-                num,
-                MAX_W,
-                now()
+                number,
+                coins,
+                status,
+                created_at
             )
+            VALUES
+            (
+                %s, %s, %s, %s, %s,
+                'pending', %s
+            )
+        """, (
+            user_id,
+            user["username"],
+            method_name,
+            number,
+            MAX_WITHDRAW,
+            now()
+        ))
+
+        cur.execute("""
+            UPDATE users
+            SET coins = coins - %s
+            WHERE user_id=%s
+            AND coins >= %s
+        """, (
+            MAX_WITHDRAW,
+            user_id,
+            MAX_WITHDRAW
+        ))
+
+        if cur.rowcount != 1:
+
+            conn.rollback()
+
+            cur.close()
+            conn.close()
+
+            send_message(
+                user_id,
+                "❌ Withdrawal failed. "
+                "Please try again.",
+                main_menu()
+            )
+
+            return
+
+        conn.commit()
+
+        cur.close()
+        conn.close()
+
+        add_history(
+            user_id,
+            -MAX_WITHDRAW,
+            "Withdrawal requested"
         )
 
-        q(
-            'UPDATE users SET coins=0 '
-            'WHERE user_id=%s',
-            (uid,)
+        admin_text = (
+            "💰 NEW WITHDRAWAL\n\n"
+            f"👤 Username: "
+            f"@{user['username'] or 'N/A'}\n"
+            f"🆔 User ID: {user_id}\n"
+            f"💳 Method: {method_name}\n"
+            f"📱 Number: {number}\n"
+            f"🪙 Coins: {MAX_WITHDRAW:,}\n"
+            f"💵 Amount: ৳100\n"
+            f"⏳ Status: Pending"
         )
 
-        hist(
-            uid,
-            -MAX_W,
-            'Withdrawal requested'
-        )
-
-        send(
+        send_message(
             ADMIN_ID,
-            f'💰 NEW WITHDRAWAL\n\n'
-            f'User: @{U["username"] or "N/A"}\n'
-            f'ID: {uid}\n'
-            f'Method: {method}\n'
-            f'Number: {num}\n'
-            f'Coins: {MAX_W:,}\n'
-            f'Amount: ৳100'
+            admin_text
         )
 
-        send(
-            uid,
-            '⏳ Payment Processing...\n\n'
-            'Your withdrawal request has been submitted.'
+        send_message(
+            user_id,
+            "⏳ Payment Processing...\n\n"
+            "Your withdrawal request has been submitted.\n"
+            "Payment will be reviewed manually.",
+            main_menu()
         )
 
         return
 
-    send(
-        uid,
-        'Please choose an option from the menu.',
-        menu()
+    # -----------------------------------------------------
+    # FALLBACK
+    # -----------------------------------------------------
+
+    send_message(
+        user_id,
+        "Please choose an option from the menu.",
+        main_menu()
     )
 
-def update(u):
 
-    if 'callback_query' in u:
-        callback(u)
+# =========================================================
+# WEBHOOK
+# =========================================================
 
-    elif 'message' in u:
-        message(u)
-
-# =========================
-# FLASK
-# =========================
-
-@app.get('/')
-def home():
-    return 'Found Coins Bot is running!',200
-
-@app.get('/health')
-def health():
-
-    try:
-        q('SELECT 1')
-        return 'OK',200
-    except:
-        return 'DB ERROR',500
-
-@app.post('/webhook')
+@app.route(
+    "/webhook",
+    methods=["POST"]
+)
 def webhook():
 
     try:
-        update(request.get_json(silent=True) or {})
-        return 'OK',200
+
+        update = request.get_json(
+            silent=True
+        )
+
+        if update:
+
+            handle_update(
+                update
+            )
+
+        return "OK", 200
 
     except Exception as e:
-        print('Webhook:',e)
-        return 'OK',200
 
-@app.get('/reward')
-def reward():
-
-    try:
-        uid=int(
-            request.args.get(
-                'userid',
-                '0'
-            )
+        print(
+            "Webhook error:",
+            e
         )
-    except:
-        uid=0
 
-    if not uid or not consume(uid):
-        return 'No valid pending ad',400
+        return "OK", 200
 
-    r=setting(
-        'ad_reward',
-        50
-    )
 
-    q(
-        'UPDATE users '
-        'SET coins=coins+%s,'
-        'coins_earned=coins_earned+%s,'
-        'ads_watched=ads_watched+1 '
-        'WHERE user_id=%s',
-        (r,r,uid)
-    )
-
-    hist(
-        uid,
-        r,
-        'AdsGram ad reward'
-    )
-
-    send(
-        uid,
-        f'🎉 Ad Completed!\n\n'
-        f'+{r} Coins added.'
-    )
-
-    return 'Reward granted',200
-
-# =========================
-# ADMIN
-# =========================
-
-def ok():
-    return session.get('admin') is True
-
-def E(x):
-    return html.escape(
-        str(x if x is not None else '')
-    )
-
-def page(body):
-
-    return f'''
-<!doctype html>
-<meta name="viewport"
-content="width=device-width,initial-scale=1">
-<title>Found Coins Admin</title>
-
-<style>
-body{{
-font-family:Arial;
-background:#f3f4f6;
-padding:12px
-}}
-
-.box{{
-background:#fff;
-padding:15px;
-margin:10px auto;
-border-radius:12px;
-overflow:auto
-}}
-
-table{{
-width:100%;
-border-collapse:collapse;
-min-width:760px
-}}
-
-td,th{{
-padding:8px;
-border-bottom:1px solid #ddd;
-text-align:left
-}}
-
-input,button{{
-padding:8px;
-margin:3px
-}}
-
-a{{
-margin:3px
-}}
-</style>
-
-<div class="box">
-{body}
-</div>
-'''
+# =========================================================
+# ADSGRAM REWARD URL
+# =========================================================
 
 @app.route(
-    '/admin',
-    methods=['GET','POST']
+    "/reward",
+    methods=["GET"]
+)
+def reward():
+
+    user_id = request.args.get(
+        "userid",
+        ""
+    ).strip()
+
+    try:
+
+        user_id = int(
+            user_id
+        )
+
+    except Exception:
+
+        return "Invalid user", 400
+
+    success = reward_adsgram_user(
+        user_id
+    )
+
+    if success:
+
+        return (
+            "Reward added successfully. "
+            "You can return to the bot.",
+            200
+        )
+
+    return (
+        "Reward is unavailable, "
+        "expired, or already claimed.",
+        200
+    )
+
+
+# =========================================================
+# HOME
+# =========================================================
+
+@app.route(
+    "/",
+    methods=["GET"]
+)
+def home():
+
+    return (
+        "Found Coins Bot is running!",
+        200
+    )
+
+
+# =========================================================
+# ADMIN LOGIN
+# =========================================================
+
+@app.route(
+    "/admin",
+    methods=["GET", "POST"]
 )
 def admin():
 
-    if ok():
-        return redirect(
-            '/admin/dashboard'
+    if request.method == "POST":
+
+        password = request.form.get(
+            "password",
+            ""
         )
 
-    err=''
+        if password == ADMIN_PASSWORD:
 
-    if request.method=='POST':
-
-        if (
-            ADMIN_PASSWORD
-            and
-            request.form.get('password','')
-            ==
-            ADMIN_PASSWORD
-        ):
-
-            session['admin']=True
+            session["admin"] = True
 
             return redirect(
-                '/admin/dashboard'
+                url_for("admin_dashboard")
             )
 
-        err='❌ Invalid password'
+        return """
+        <html>
+        <body>
+        <h3>Wrong password</h3>
+        <a href="/admin">Try again</a>
+        </body>
+        </html>
+        """
 
-    return page(
-        f'''
-        <h1>🔐 Found Coins Admin</h1>
-        <p>{err}</p>
+    if session.get("admin"):
 
-        <form method="post">
-        <input
+        return redirect(
+            url_for("admin_dashboard")
+        )
+
+    return """
+    <!doctype html>
+    <html>
+    <head>
+    <meta name="viewport"
+          content="width=device-width,initial-scale=1">
+    <title>Found Coins Admin</title>
+    </head>
+    <body>
+
+    <h2>🔐 Found Coins Admin</h2>
+
+    <form method="post">
+
+    <input
         type="password"
         name="password"
-        placeholder="Admin password"
-        required>
+        placeholder="Admin Password"
+        required
+    >
 
-        <button>Login</button>
-        </form>
-        '''
-    )
+    <button type="submit">
+        Login
+    </button>
 
-@app.get('/admin/logout')
-def logout():
+    </form>
 
-    session.clear()
+    </body>
+    </html>
+    """
 
-    return redirect('/admin')
 
-def wrow(x):
+# =========================================================
+# ADMIN DASHBOARD
+# =========================================================
 
-    a=''
+@app.route(
+    "/admin/dashboard",
+    methods=["GET"]
+)
+def admin_dashboard():
 
-    if x['status']=='pending':
+    if not session.get("admin"):
 
-        a=(
-            f"<form method='post' "
-            f"action='/admin/withdrawal/"
-            f"{x['id']}/approve'>"
-            f"<button>Approve</button></form>"
-
-            f"<form method='post' "
-            f"action='/admin/withdrawal/"
-            f"{x['id']}/reject'>"
-            f"<button>Reject</button></form>"
+        return redirect(
+            url_for("admin")
         )
 
-    return (
-        f"<tr>"
-        f"<td>#{x['id']}</td>"
-        f"<td>{x['user_id']}</td>"
-        f"<td>{E(x['method'])}</td>"
-        f"<td>{E(x['number'])}</td>"
-        f"<td>{x['coins']:,}</td>"
-        f"<td>{x['status']}</td>"
-        f"<td>{a}</td>"
-        f"</tr>"
+    conn = db()
+
+    cur = conn.cursor(
+        cursor_factory=
+        psycopg2.extras.RealDictCursor
     )
 
-def prow(x):
+    # -----------------------------------------------------
+    # BASIC STATS
+    # -----------------------------------------------------
 
-    a=''
+    cur.execute(
+        "SELECT COUNT(*) AS total FROM users"
+    )
 
-    if x['status']=='pending':
+    total_users = cur.fetchone()["total"]
 
-        a=(
-            f"<form method='post' "
-            f"action='/admin/shop/purchase/"
-            f"{x['id']}/approve'>"
-            f"<button>Approve</button></form>"
+    # Real active users based on recent bot activity
+    active_limit = (
+        datetime.now()
+        - timedelta(minutes=ACTIVE_MINUTES)
+    ).strftime("%Y-%m-%d %H:%M:%S")
 
-            f"<form method='post' "
-            f"action='/admin/shop/purchase/"
-            f"{x['id']}/reject'>"
-            f"<button>Reject</button></form>"
+    cur.execute("""
+        SELECT COUNT(*) AS total
+        FROM users
+        WHERE blocked=0
+        AND last_seen IS NOT NULL
+        AND last_seen >= %s
+    """, (
+        active_limit,
+    ))
+
+    active_users = cur.fetchone()["total"]
+
+    inactive_users = max(
+        total_users - active_users,
+        0
+    )
+
+    cur.execute("""
+        SELECT COALESCE(SUM(coins),0) AS total
+        FROM users
+    """)
+
+    total_coins = cur.fetchone()["total"]
+
+    cur.execute("""
+        SELECT COALESCE(SUM(ads_watched),0) AS total
+        FROM users
+    """)
+
+    total_ads = cur.fetchone()["total"]
+
+    # -----------------------------------------------------
+    # BADGE COUNTS
+    # -----------------------------------------------------
+
+    cur.execute("""
+        SELECT COUNT(*) AS total
+        FROM users
+        WHERE badge='🏅 Badge 1'
+    """)
+
+    badge1_count = cur.fetchone()["total"]
+
+    cur.execute("""
+        SELECT COUNT(*) AS total
+        FROM users
+        WHERE badge='🥇 Badge 2'
+    """)
+
+    badge2_count = cur.fetchone()["total"]
+
+    cur.execute("""
+        SELECT COUNT(*) AS total
+        FROM users
+        WHERE badge='💎 Badge 3'
+    """)
+
+    badge3_count = cur.fetchone()["total"]
+
+    cur.execute("""
+        SELECT COUNT(*) AS total
+        FROM users
+        WHERE badge='👑 VIP Badge'
+    """)
+
+    vip_count = cur.fetchone()["total"]
+
+    # -----------------------------------------------------
+    # USERS
+    # -----------------------------------------------------
+
+    cur.execute("""
+        SELECT
+            user_id,
+            username,
+            profile_name,
+            coins,
+            ads_watched,
+            coins_earned,
+            badge,
+            blocked,
+            last_seen
+        FROM users
+        ORDER BY joined_at DESC
+        LIMIT 100
+    """)
+
+    users = cur.fetchall()
+
+    # -----------------------------------------------------
+    # WITHDRAWALS
+    # -----------------------------------------------------
+
+    cur.execute("""
+        SELECT
+            id,
+            user_id,
+            username,
+            method,
+            number,
+            coins,
+            status,
+            created_at
+        FROM withdrawals
+        ORDER BY id DESC
+        LIMIT 100
+    """)
+
+    withdrawals = cur.fetchall()
+
+    cur.close()
+    conn.close()
+
+    # -----------------------------------------------------
+    # USERS HTML
+    # -----------------------------------------------------
+
+    users_html = ""
+
+    for u in users:
+
+        last_seen = u["last_seen"]
+
+        is_active = False
+
+        if last_seen:
+
+            try:
+
+                last_seen_dt = datetime.strptime(
+                    last_seen,
+                    "%Y-%m-%d %H:%M:%S"
+                )
+
+                is_active = (
+                    datetime.now() - last_seen_dt
+                    <= timedelta(minutes=ACTIVE_MINUTES)
+                )
+
+            except Exception:
+
+                is_active = False
+
+        if u["blocked"]:
+
+            status = "🚫 Blocked"
+
+        elif is_active:
+
+            status = "🟢 Active"
+
+        else:
+
+            status = "⚫ Inactive"
+
+        display_name = (
+            u["profile_name"]
+            or u["username"]
+            or "N/A"
         )
 
-    return (
-        f"<tr>"
-        f"<td>#{x['id']}</td>"
-        f"<td>{x['user_id']}</td>"
-        f"<td>{E(x['item_name'])}</td>"
-        f"<td>{x['price']:,}</td>"
-        f"<td>{x['status']}</td>"
-        f"<td>{a}</td>"
-        f"</tr>"
-    )
+        badge = (
+            u["badge"]
+            or "—"
+        )
 
-@app.get('/admin/dashboard')
-def dashboard():
-
-    if not ok():
-        return redirect('/admin')
-
-    users=q(
-        'SELECT * FROM users '
-        'ORDER BY joined_at DESC LIMIT 200',
-        (),
-        True,
-        True
-    )
-
-    ws=q(
-        'SELECT * FROM withdrawals '
-        'ORDER BY id DESC LIMIT 100',
-        (),
-        True,
-        True
-    )
-
-    ps=q(
-        'SELECT * FROM shop_purchases '
-        'ORDER BY id DESC LIMIT 100',
-        (),
-        True,
-        True
-    )
-
-    ur=''.join(
-        f"""
+        users_html += f"""
         <tr>
-        <td>{x['user_id']}</td>
-        <td>@{E(x['username'] or 'N/A')}</td>
-        <td>{x['coins']:,}</td>
-        <td>{x['ads_watched']}</td>
-
-        <td>
-        <form method='post'
-        action='/admin/user/{x["user_id"]}/coins'>
-
-        <input
-        name='coins'
-        type='number'
-        min='0'
-        value='{x["coins"]}'>
-
-        <button>✏️ Edit</button>
-        </form>
-        </td>
-
-        <td>
-        <a href='/admin/user/{x["user_id"]}'>
-        Profile
-        </a>
-        </td>
-
-        <td>
-        <form method='post'
-        action='/admin/user/{x["user_id"]}/block'>
-
-        <button>
-        {'Unblock' if x['blocked'] else 'Block'}
-        </button>
-
-        </form>
-        </td>
-
+        <td>{u['user_id']}</td>
+        <td>{html.escape(str(display_name))}</td>
+        <td>{u['coins']:,}</td>
+        <td>{u['ads_watched']:,}</td>
+        <td>{u['coins_earned']:,}</td>
+        <td>{html.escape(str(badge))}</td>
+        <td>{status}</td>
         </tr>
         """
-        for x in users
-    )
 
-    wr=''.join(
-        wrow(x)
-        for x in ws
-    )
+    # -----------------------------------------------------
+    # WITHDRAWAL HTML
+    # -----------------------------------------------------
 
-    sr=''.join(
-        prow(x)
-        for x in ps
-    )
+    withdrawal_html = ""
 
-    return page(
-        f"""
-        <h1>🛠️ Found Coins Admin</h1>
+    for w in withdrawals:
 
-        <p>
-        <a href='/admin/shop'>
-        🛍️ Coin Shop
-        </a>
+        actions = ""
 
-        <a href='/admin/logout'>
+        if w["status"] == "pending":
+
+            actions = f"""
+            <a href="/admin/withdraw/{w['id']}/approve">
+                ✅ Approve
+            </a>
+
+            |
+
+            <a href="/admin/withdraw/{w['id']}/reject">
+                ❌ Reject
+            </a>
+            """
+
+        withdrawal_html += f"""
+        <tr>
+        <td>{w['id']}</td>
+        <td>{w['user_id']}</td>
+        <td>
+            @{html.escape(w['username'] or 'N/A')}
+        </td>
+        <td>{html.escape(w['method'] or '')}</td>
+        <td>{html.escape(w['number'] or '')}</td>
+        <td>{w['coins']:,}</td>
+        <td>{html.escape(w['status'])}</td>
+        <td>{actions}</td>
+        </tr>
+        """
+
+    # -----------------------------------------------------
+    # ADMIN DASHBOARD
+    # -----------------------------------------------------
+
+    return f"""
+    <!doctype html>
+
+    <html>
+
+    <head>
+
+    <meta name="viewport"
+          content="width=device-width,initial-scale=1">
+
+    <title>Found Coins Admin</title>
+
+    <style>
+
+    body {{
+        font-family: Arial;
+        margin: 20px;
+    }}
+
+    table {{
+        border-collapse: collapse;
+        width: 100%;
+        margin-top: 15px;
+    }}
+
+    th, td {{
+        border: 1px solid #ddd;
+        padding: 8px;
+        text-align: left;
+    }}
+
+    th {{
+        background: #f2f2f2;
+    }}
+
+    .stats {{
+        display: grid;
+        grid-template-columns:
+            repeat(auto-fit,minmax(150px,1fr));
+        gap: 10px;
+    }}
+
+    .box {{
+        border: 1px solid #ddd;
+        padding: 15px;
+        border-radius: 8px;
+    }}
+
+    .badge-box {{
+        border: 1px solid #ddd;
+        padding: 15px;
+        border-radius: 8px;
+        margin-top: 10px;
+    }}
+
+    .active {{
+        color: green;
+        font-weight: bold;
+    }}
+
+    .inactive {{
+        color: #666;
+        font-weight: bold;
+    }}
+
+    </style>
+
+    </head>
+
+    <body>
+
+    <h2>🛠️ Found Coins Admin Panel</h2>
+
+    <p>
+    <a href="/admin/logout">
         Logout
-        </a>
-        </p>
+    </a>
+    </p>
 
-        <p>
-        👥 Users: {len(users)}
-        |
-        💰 Pending withdrawals:
-        {sum(x['status']=='pending' for x in ws)}
-        |
-        🛍️ Pending purchases:
-        {sum(x['status']=='pending' for x in ps)}
-        </p>
+    <div class="stats">
 
-        <div class='box'>
-
-        <h2>⚙️ Rewards</h2>
-
-        <form method='post'
-        action='/admin/settings'>
-
-        Daily Bonus
-
-        <input
-        name='daily_bonus'
-        type='number'
-        min='0'
-        value='{setting("daily_bonus",5)}'>
-
-        Ad
-
-        <input
-        name='ad_reward'
-        type='number'
-        min='0'
-        value='{setting("ad_reward",50)}'>
-
-        Referral
-
-        <input
-        name='referral_bonus'
-        type='number'
-        min='0'
-        value='{setting("referral_bonus",100)}'>
-
-        Task
-
-        <input
-        name='task_reward'
-        type='number'
-        min='0'
-        value='{setting("task_reward",5)}'>
-
-        <button>💾 Save</button>
-
-        </form>
-
+        <div class="box">
+            👥 Total Users<br>
+            <b>{total_users:,}</b>
         </div>
 
-        <div class='box'>
+        <div class="box">
+            🟢 Active Users<br>
+            <b>{active_users:,}</b>
+        </div>
 
-        <h2>👤 Users</h2>
+        <div class="box">
+            ⚫ Inactive Users<br>
+            <b>{inactive_users:,}</b>
+        </div>
 
-        <table>
+        <div class="box">
+            🪙 Total Coins<br>
+            <b>{total_coins:,}</b>
+        </div>
 
-        <tr>
+        <div class="box">
+            📺 Ads Watched<br>
+            <b>{total_ads:,}</b>
+        </div>
+
+    </div>
+
+    <h2>🏅 Active Badges</h2>
+
+    <div class="stats">
+
+        <div class="badge-box">
+            🏅 Badge 1<br>
+            <b>{badge1_count:,} Users</b>
+        </div>
+
+        <div class="badge-box">
+            🥇 Badge 2<br>
+            <b>{badge2_count:,} Users</b>
+        </div>
+
+        <div class="badge-box">
+            💎 Badge 3<br>
+            <b>{badge3_count:,} Users</b>
+        </div>
+
+        <div class="badge-box">
+            👑 VIP Badge<br>
+            <b>{vip_count:,} Users</b>
+        </div>
+
+    </div>
+
+    <p>
+        🟢 Active = last interaction within
+        {ACTIVE_MINUTES} minutes.
+    </p>
+
+    <h2>👥 Users</h2>
+
+    <table>
+
+    <tr>
         <th>ID</th>
-        <th>User</th>
+        <th>Name</th>
         <th>Coins</th>
         <th>Ads</th>
-        <th>Edit</th>
-        <th>Profile</th>
-        <th>Block</th>
-        </tr>
+        <th>Earned</th>
+        <th>Badge</th>
+        <th>Status</th>
+    </tr>
 
-        {ur}
+    {users_html}
 
-        </table>
+    </table>
 
-        </div>
+    <h2>💰 Withdrawals</h2>
 
-        <div class='box'>
+    <table>
 
-        <h2>💰 Withdrawals</h2>
-
-        <table>
-
-        <tr>
+    <tr>
         <th>ID</th>
-        <th>User</th>
+        <th>User ID</th>
+        <th>Username</th>
         <th>Method</th>
         <th>Number</th>
         <th>Coins</th>
         <th>Status</th>
-        <th>Actions</th>
-        </tr>
+        <th>Action</th>
+    </tr>
 
-        {wr}
+    {withdrawal_html}
 
-        </table>
+    </table>
 
-        </div>
+    </body>
+    </html>
+    """
 
-        <div class='box'>
 
-        <h2>🛍️ Purchases</h2>
-
-        <table>
-
-        <tr>
-        <th>ID</th>
-        <th>User</th>
-        <th>Item</th>
-        <th>Price</th>
-        <th>Status</th>
-        <th>Actions</th>
-        </tr>
-
-        {sr}
-
-        </table>
-
-        </div>
-        """
-    )
-
-@app.post('/admin/settings')
-def settings():
-
-    if not ok():
-        return redirect('/admin')
-
-    for k in (
-        'daily_bonus',
-        'ad_reward',
-        'referral_bonus',
-        'task_reward'
-    ):
-
-        try:
-            setsetting(
-                k,
-                int(
-                    request.form.get(
-                        k,
-                        '0'
-                    )
-                )
-            )
-        except:
-            pass
-
-    return redirect(
-        '/admin/dashboard'
-    )
-
-@app.get('/admin/user/<int:uid>')
-def userpage(uid):
-
-    if not ok():
-        return redirect('/admin')
-
-    u=user(uid)
-
-    if not u:
-        return page(
-            '<h2>User not found.</h2>'
-        )
-
-    h=q(
-        'SELECT * FROM history '
-        'WHERE user_id=%s '
-        'ORDER BY id DESC LIMIT 50',
-        (uid,),
-        True,
-        True
-    )
-
-    rows=''.join(
-        f"""
-        <tr>
-        <td>{x['amount']}</td>
-        <td>{E(x['reason'])}</td>
-        <td>{x['created_at']}</td>
-        </tr>
-        """
-        for x in h
-    )
-
-    return page(
-        f"""
-        <h1>👤 User Profile</h1>
-
-        <p>
-        <a href='/admin/dashboard'>
-        ← Dashboard
-        </a>
-        </p>
-
-        <p>
-        ID: {uid}<br>
-        Username: @{E(u['username'] or 'N/A')}<br>
-        Coins: {u['coins']:,}<br>
-        Ads: {u['ads_watched']}<br>
-        Total Earned: {u['coins_earned']:,}<br>
-        Status:
-        {'Blocked' if u['blocked'] else 'Active'}
-        </p>
-
-        <form method='post'
-        action='/admin/user/{uid}/coins'>
-
-        <input
-        name='coins'
-        type='number'
-        min='0'
-        value='{u['coins']}'>
-
-        <button>
-        💾 Save Coins
-        </button>
-
-        </form>
-
-        <h3>📜 History</h3>
-
-        <table>
-
-        <tr>
-        <th>Amount</th>
-        <th>Reason</th>
-        <th>Date</th>
-        </tr>
-
-        {rows}
-
-        </table>
-        """
-    )
-
-@app.post('/admin/user/<int:uid>/coins')
-def editcoins(uid):
-
-    if not ok():
-        return redirect('/admin')
-
-    try:
-        n=max(
-            0,
-            int(
-                request.form.get(
-                    'coins',
-                    '0'
-                )
-            )
-        )
-    except:
-        n=0
-
-    u=user(uid)
-
-    if u:
-
-        q(
-            'UPDATE users SET coins=%s '
-            'WHERE user_id=%s',
-            (n,uid)
-        )
-
-        hist(
-            uid,
-            n-u['coins'],
-            'Admin edited coin balance'
-        )
-
-        send(
-            uid,
-            f'🛠️ Admin updated your balance.\n'
-            f'🪙 New balance: {n:,}'
-        )
-
-    return redirect(
-        f'/admin/user/{uid}'
-    )
-
-@app.post('/admin/user/<int:uid>/block')
-def block(uid):
-
-    if not ok():
-        return redirect('/admin')
-
-    q(
-        'UPDATE users '
-        'SET blocked=CASE '
-        'WHEN blocked=1 THEN 0 '
-        'ELSE 1 END '
-        'WHERE user_id=%s',
-        (uid,)
-    )
-
-    return redirect(
-        '/admin/dashboard'
-    )
-
-@app.post('/admin/withdrawal/<int:wid>/<action>')
-def withdraw(wid,action):
-
-    if (
-        not ok()
-        or
-        action not in (
-            'approve',
-            'reject'
-        )
-    ):
-        return redirect(
-            '/admin/dashboard'
-        )
-
-    r=q(
-        'SELECT * FROM withdrawals '
-        'WHERE id=%s',
-        (wid,),
-        True,
-        True
-    )
-
-    if (
-        not r
-        or
-        r[0]['status']!='pending'
-    ):
-        return redirect(
-            '/admin/dashboard'
-        )
-
-    w=r[0]
-
-    if action=='approve':
-
-        q(
-            "UPDATE withdrawals "
-            "SET status='approved' "
-            "WHERE id=%s",
-            (wid,)
-        )
-
-        msg='✅ Your withdrawal was approved.'
-
-    else:
-
-        q(
-            "UPDATE withdrawals "
-            "SET status='rejected' "
-            "WHERE id=%s",
-            (wid,)
-        )
-
-        q(
-            'UPDATE users '
-            'SET coins=coins+%s '
-            'WHERE user_id=%s',
-            (
-                w['coins'],
-                w['user_id']
-            )
-        )
-
-        hist(
-            w['user_id'],
-            w['coins'],
-            'Withdrawal rejected/refunded'
-        )
-
-        msg=(
-            f"❌ Withdrawal rejected.\n"
-            f"+{w['coins']:,} Coins refunded."
-        )
-
-    send(
-        w['user_id'],
-        msg
-    )
-
-    return redirect(
-        '/admin/dashboard'
-    )
-
-# =========================
-# SHOP ADMIN
-# =========================
-
-@app.get('/admin/shop')
-def shopadmin():
-
-    if not ok():
-        return redirect('/admin')
-
-    xs=q(
-        'SELECT * FROM shop_items '
-        'ORDER BY id',
-        (),
-        True,
-        True
-    )
-
-    rows=''.join(
-        f"""
-        <tr>
-        <td>{x['id']}</td>
-        <td>{E(x['name'])}</td>
-        <td>{E(x['description'])}</td>
-        <td>{x['price']:,}</td>
-        <td>{'ON' if x['active'] else 'OFF'}</td>
-
-        <td>
-
-        <a href='/admin/shop/{x["id"]}/edit'>
-        ✏️ Edit
-        </a>
-
-        <form
-        style='display:inline'
-        method='post'
-        action='/admin/shop/{x["id"]}/delete'>
-
-        <button>
-        🗑️ Delete
-        </button>
-
-        </form>
-
-        </td>
-
-        </tr>
-        """
-        for x in xs
-    )
-
-    return page(
-        f"""
-        <h1>🛍️ Coin Shop</h1>
-
-        <p>
-        <a href='/admin/dashboard'>
-        ← Dashboard
-        </a>
-        </p>
-
-        <form
-        method='post'
-        action='/admin/shop/add'>
-
-        <input
-        name='name'
-        placeholder='Name'
-        required>
-
-        <input
-        name='description'
-        placeholder='Description'>
-
-        <input
-        name='price'
-        type='number'
-        min='0'
-        placeholder='Price'
-        required>
-
-        <button>
-        ➕ Add
-        </button>
-
-        </form>
-
-        <table>
-
-        <tr>
-        <th>ID</th>
-        <th>Name</th>
-        <th>Description</th>
-        <th>Price</th>
-        <th>Status</th>
-        <th>Actions</th>
-        </tr>
-
-        {rows}
-
-        </table>
-        """
-    )
-
-@app.post('/admin/shop/add')
-def shopadd():
-
-    if not ok():
-        return redirect('/admin')
-
-    try:
-        p=max(
-            0,
-            int(
-                request.form.get(
-                    'price',
-                    '0'
-                )
-            )
-        )
-    except:
-        p=0
-
-    n=request.form.get(
-        'name',
-        ''
-    ).strip()
-
-    d=request.form.get(
-        'description',
-        ''
-    ).strip()
-
-    if n:
-
-        q(
-            'INSERT INTO shop_items'
-            '(name,description,price,active,created_at) '
-            'VALUES(%s,%s,%s,1,%s)',
-            (
-                n,
-                d,
-                p,
-                now()
-            )
-        )
-
-    return redirect(
-        '/admin/shop'
-    )
+# =========================================================
+# ADMIN WITHDRAW APPROVE
+# =========================================================
 
 @app.route(
-    '/admin/shop/<int:iid>/edit',
-    methods=['GET','POST']
+    "/admin/withdraw/<int:withdrawal_id>/approve"
 )
-def shopedit(iid):
+def approve_withdrawal(
+    withdrawal_id
+):
 
-    if not ok():
-        return redirect('/admin')
-
-    r=q(
-        'SELECT * FROM shop_items '
-        'WHERE id=%s',
-        (iid,),
-        True,
-        True
-    )
-
-    if not r:
-        return page(
-            'Item not found'
-        )
-
-    x=r[0]
-
-    if request.method=='POST':
-
-        try:
-            p=max(
-                0,
-                int(
-                    request.form.get(
-                        'price',
-                        '0'
-                    )
-                )
-            )
-        except:
-            p=0
-
-        q(
-            'UPDATE shop_items '
-            'SET name=%s,'
-            'description=%s,'
-            'price=%s,'
-            'active=%s '
-            'WHERE id=%s',
-            (
-                request.form.get(
-                    'name',
-                    ''
-                ).strip(),
-
-                request.form.get(
-                    'description',
-                    ''
-                ).strip(),
-
-                p,
-
-                1 if request.form.get(
-                    'active'
-                ) else 0,
-
-                iid
-            )
-        )
+    if not session.get("admin"):
 
         return redirect(
-            '/admin/shop'
+            url_for("admin")
         )
 
-    return page(
-        f"""
-        <h1>✏️ Edit Shop Item</h1>
+    conn = db()
 
-        <form method='post'>
-
-        <input
-        name='name'
-        value='{E(x["name"])}'
-        required>
-
-        <br>
-
-        <input
-        name='description'
-        value='{E(x["description"])}'>
-
-        <br>
-
-        <input
-        name='price'
-        type='number'
-        min='0'
-        value='{x["price"]}'>
-
-        <br>
-
-        <label>
-
-        <input
-        type='checkbox'
-        name='active'
-        {'checked' if x['active'] else ''}>
-
-        Active
-
-        </label>
-
-        <br>
-
-        <button>
-        💾 Save
-        </button>
-
-        </form>
-
-        <p>
-        <a href='/admin/shop'>
-        ← Shop
-        </a>
-        </p>
-        """
+    cur = conn.cursor(
+        cursor_factory=
+        psycopg2.extras.RealDictCursor
     )
 
-@app.post('/admin/shop/<int:iid>/delete')
-def shopdelete(iid):
+    cur.execute("""
+        UPDATE withdrawals
+        SET status='approved'
+        WHERE id=%s
+        AND status='pending'
+        RETURNING user_id
+    """, (
+        withdrawal_id,
+    ))
 
-    if not ok():
-        return redirect('/admin')
+    row = cur.fetchone()
 
-    # Safe delete: hide the item.
-    # Old purchase/history data stays preserved.
-    q(
-        'UPDATE shop_items '
-        'SET active=0 '
-        'WHERE id=%s',
-        (iid,)
+    conn.commit()
+
+    cur.close()
+    conn.close()
+
+    if row:
+
+        send_message(
+            row["user_id"],
+            "✅ Withdrawal Approved!\n\n"
+            "Your payment has been approved "
+            "by the admin."
+        )
+
+    return redirect(
+        url_for("admin_dashboard")
+    )
+
+
+# =========================================================
+# ADMIN WITHDRAW REJECT
+# =========================================================
+
+@app.route(
+    "/admin/withdraw/<int:withdrawal_id>/reject"
+)
+def reject_withdrawal(
+    withdrawal_id
+):
+
+    if not session.get("admin"):
+
+        return redirect(
+            url_for("admin")
+        )
+
+    conn = db()
+
+    cur = conn.cursor(
+        cursor_factory=
+        psycopg2.extras.RealDictCursor
+    )
+
+    try:
+
+        cur.execute("""
+            SELECT
+                user_id,
+                coins
+            FROM withdrawals
+            WHERE id=%s
+            AND status='pending'
+            FOR UPDATE
+        """, (
+            withdrawal_id,
+        ))
+
+        row = cur.fetchone()
+
+        if not row:
+
+            conn.rollback()
+
+            cur.close()
+            conn.close()
+
+            return redirect(
+                url_for("admin_dashboard")
+            )
+
+        cur.execute("""
+            UPDATE withdrawals
+            SET status='rejected'
+            WHERE id=%s
+            AND status='pending'
+        """, (
+            withdrawal_id,
+        ))
+
+        if cur.rowcount != 1:
+
+            conn.rollback()
+
+            cur.close()
+            conn.close()
+
+            return redirect(
+                url_for("admin_dashboard")
+            )
+
+        cur.execute("""
+            UPDATE users
+            SET coins = coins + %s
+            WHERE user_id=%s
+        """, (
+            row["coins"],
+            row["user_id"]
+        ))
+
+        cur.execute("""
+            INSERT INTO history
+            (
+                user_id,
+                amount,
+                reason,
+                created_at
+            )
+            VALUES (%s, %s, %s, %s)
+        """, (
+            row["user_id"],
+            row["coins"],
+            "Withdrawal rejected - coins returned",
+            now()
+        ))
+
+        conn.commit()
+
+    except Exception:
+
+        conn.rollback()
+
+        raise
+
+    finally:
+
+        cur.close()
+        conn.close()
+
+    send_message(
+        row["user_id"],
+        "❌ Withdrawal Rejected.\n\n"
+        f"{row['coins']:,} Coins "
+        "have been returned to your balance."
     )
 
     return redirect(
-        '/admin/shop'
+        url_for("admin_dashboard")
     )
 
-@app.post('/admin/shop/purchase/<int:pid>/<action>')
-def purchase(pid,action):
 
-    if (
-        not ok()
-        or
-        action not in (
-            'approve',
-            'reject'
-        )
-    ):
-        return redirect(
-            '/admin/dashboard'
-        )
+# =========================================================
+# ADMIN LOGOUT
+# =========================================================
 
-    r=q(
-        'SELECT * FROM shop_purchases '
-        'WHERE id=%s',
-        (pid,),
-        True,
-        True
-    )
+@app.route(
+    "/admin/logout"
+)
+def admin_logout():
 
-    if (
-        not r
-        or
-        r[0]['status']!='pending'
-    ):
-        return redirect(
-            '/admin/dashboard'
-        )
-
-    p=r[0]
-
-    if action=='approve':
-
-        q(
-            "UPDATE shop_purchases "
-            "SET status='approved',"
-            "processed_at=%s "
-            "WHERE id=%s",
-            (now(),pid)
-        )
-
-        msg=(
-            f"✅ Purchase approved.\n\n"
-            f"Item: {p['item_name']}"
-        )
-
-    else:
-
-        q(
-            "UPDATE shop_purchases "
-            "SET status='rejected',"
-            "processed_at=%s "
-            "WHERE id=%s",
-            (now(),pid)
-        )
-
-        q(
-            'UPDATE users '
-            'SET coins=coins+%s '
-            'WHERE user_id=%s',
-            (
-                p['price'],
-                p['user_id']
-            )
-        )
-
-        hist(
-            p['user_id'],
-            p['price'],
-            f"Shop purchase rejected/refunded: "
-            f"{p['item_name']}"
-        )
-
-        msg=(
-            f"❌ Purchase rejected.\n"
-            f"+{p['price']:,} Coins refunded."
-        )
-
-    send(
-        p['user_id'],
-        msg
-    )
+    session.clear()
 
     return redirect(
-        '/admin/dashboard'
+        url_for("admin")
     )
 
-if __name__=='__main__':
+
+# =========================================================
+# RUN
+# =========================================================
+
+if __name__ == "__main__":
+
+    port = int(
+        os.environ.get(
+            "PORT",
+            10000
+        )
+    )
 
     app.run(
-        host='0.0.0.0',
-        port=int(
-            os.environ.get(
-                'PORT',
-                10000
-            )
-        )
+        host="0.0.0.0",
+        port=port
     )
